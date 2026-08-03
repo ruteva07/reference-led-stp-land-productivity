@@ -1,0 +1,2321 @@
+# -*- coding: utf-8 -*-
+"""
+PERFORMANCE — benchmark-window relative NDVI change for Africa
+==============================================================
+
+Author
+------
+Evariste Rutebuka
+
+Purpose
+-------
+Core Performance workflow used to quantify the magnitude and direction of
+pixel-level NDVI change relative to a fixed early-period baseline.
+
+The script reuses the harmonised annual NDVI and land-cover rasters generated
+by the State workflow. It does not rebuild MODIS composites from raw 16-day
+observations and it does not use predicted NDVI from a Trend model.
+
+Performance is therefore deliberately distinct from Trend:
+
+    Trend
+        asks whether a directional temporal tendency is supported across a
+        sequence of annual observations.
+
+    Performance
+        asks how large the observed NDVI difference is between a fixed
+        baseline window and a later reporting window.
+
+Annual NDVI inputs
+------------------
+Each input NDVI raster is the annual-mean State-cache raster for that year.
+Performance then averages those annual rasters within three-year windows,
+giving each available year equal weight.
+
+Baseline:
+    2001–2003 = mean of annual NDVI for 2001, 2002 and 2003
+
+2011 reporting window:
+    2009–2011 = mean of annual NDVI for 2009, 2010 and 2011
+
+2022 reporting window:
+    2020–2022 = mean of annual NDVI for 2020, 2021 and 2022
+
+At least two valid annual NDVI values are required within each three-year
+window. Thus, one missing annual value does not automatically remove a pixel.
+
+Performance calculation
+-----------------------
+For a reporting window t:
+
+    NDVI_delta_t = NDVI_reporting_t - NDVI_baseline
+
+    Performance_t (%) =
+        ((NDVI_reporting_t - NDVI_baseline) / NDVI_baseline) * 100
+
+The calculation is performed only where both window means are finite and the
+baseline mean is greater than BASELINE_DENOMINATOR_EPS.
+
+The production value of BASELINE_DENOMINATOR_EPS is 1e-6. This excludes
+non-positive/effectively-zero baselines but intentionally does not impose a
+larger low-NDVI cutoff. Consequently, relative percentage change can be large
+where baseline NDVI is small but positive; this production behaviour is
+preserved rather than silently altered in the archive.
+
+Performance classes
+-------------------
+The percentage-change raster is converted to five classes:
+
+    0 = NoData / not classified
+    1 = Strong loss       <= -10%
+    2 = Moderate loss     > -10% to -5%
+    3 = Stable            > -5% to +5%
+    4 = Moderate gain     > +5% to +10%
+    5 = Strong gain       > +10%
+
+These thresholds classify magnitude of observed relative change. They do not
+represent statistical significance and are not derived from the Trend tests.
+
+NDVI screening
+--------------
+This script reads annual NDVI rasters from the State cache and masks:
+
+    - the raster's declared NoData value;
+    - the configured NDVI NoData value (-9999); and
+    - annual NDVI outside the configured range (-0.2 to 1.0).
+
+No additional MOD13Q1 QA-band filtering is applied at the Performance stage.
+
+Land-cover attribution
+----------------------
+Land cover does not enter the pixel-level Performance calculation.
+
+For summaries:
+    - baseline NDVI summaries use 2001 LULC;
+    - 2011 Performance summaries use 2011 LULC;
+    - 2022 Performance summaries use 2022 LULC.
+
+Sparse/bare and water/snow/ice are excluded from the retained analysis-LULC
+summary domain.
+
+The original broad Performance summaries are retained for provenance. A
+vegetated-domain master summary is also generated from reporting-year
+LULC-stratified rows so country, ecoregion and country × ecoregion percentages
+use the same retained analysis-LULC denominator. This sidecar affects reporting
+aggregation only; it does not modify the Performance rasters or classes.
+
+Primary reusable outputs
+------------------------
+For each reporting window the core workflow writes:
+
+    - reporting-window mean NDVI;
+    - reporting-window valid-year count;
+    - absolute NDVI difference from the fixed baseline;
+    - percentage NDVI change from the fixed baseline; and
+    - five-class Performance raster.
+
+The baseline mean NDVI and valid-year count are also written once and reused
+across reporting windows.
+
+
+"""
+#%%
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Tuple
+from contextlib import ExitStack
+from datetime import datetime, timedelta
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import rasterio
+import matplotlib.pyplot as plt
+from rasterio.windows import Window
+
+#%%
+# =============================================================================
+# 0. USER SETTINGS
+# =============================================================================
+MAIN_FOLDER = Path(r"C:\PATH\TO\Paper\Codes\Africa")
+
+TIME_TAG = "Annual"
+
+STATE_CACHE_DIR = (
+    MAIN_FOLDER
+    / "STATE_NDVI_Africa_Loop_Annual"
+    / "_continental_cache"
+    / TIME_TAG
+)
+
+LOOKUP_DIR = (
+    MAIN_FOLDER
+    / "STATE_NDVI_Africa_Loop_Annual"
+    / "lookups"
+)
+ 
+PERF_OUT_ROOT = (
+    MAIN_FOLDER
+    / "PERFORMANCE_NDVI_Africa_Annual"
+    / TIME_TAG
+)
+PERF_OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+PREFIX = "PerfNDVI"
+
+# Build continental performance rasters.
+RUN_BUILD_PERFORMANCE_RASTERS = True
+
+# Optional later stage. Keep False for first run to focus on reusable rasters.
+RUN_SUMMARY_TABLES = True
+
+# Create PNG charts from the summary tables.
+# Recommended when summaries already exist or are being rebuilt.
+RUN_CHARTS = True
+
+# Number of top ecoregions to show in hotspot charts.
+TOP_N_ECOREGIONS = 30
+TOP_N_COUNTRIES = 49
+
+# If True and summary CSVs already exist, charts can be created without re-running
+# the summary stage.
+REUSE_EXISTING_SUMMARY_TABLES = True
+
+# If True, existing performance rasters are rebuilt.
+FORCE_REBUILD_PERFORMANCE_RASTERS = False
+
+# If True, completed performance windows are skipped when their core outputs exist.
+REUSE_EXISTING_PERFORMANCE_RASTERS = True
+
+# ---------------------------------------------------------------------
+# Vegetated-domain sidecar for charting and manuscript-ready summaries
+# ---------------------------------------------------------------------
+# The original master CSV is kept unchanged. This sidecar rebuilds only the broad
+# summary levels (ecoregion, country, ecoregion_country) from the reporting-year
+# LULC-stratified rows, so their percentages use the retained vegetated /
+# analysis-relevant LULC denominator.
+RUN_VEGETATED_DOMAIN_MASTER = True
+
+# If True, charts use the vegetated-domain master summary instead of the original
+# full-domain broad summaries.
+USE_VEGETATED_DOMAIN_FOR_CHARTS = True
+
+# If True, reuse the existing vegetated-domain master CSV if it exists.
+# If False, rebuild it each time before charts are created. Rebuilding is fast
+# because it only reads and aggregates the existing summary table.
+REUSE_EXISTING_VEGETATED_DOMAIN_MASTER = False
+
+SAVE_VEGETATED_DOMAIN_CHECK_TABLE = True
+
+
+# =============================================================================
+# 1. PERFORMANCE WINDOWS
+# =============================================================================
+
+BASELINE_WINDOW_NAME = "Baseline_2001_2003"
+BASELINE_YEARS = [2001, 2002, 2003]
+BASELINE_LULC_YEAR = 2001
+
+# Reporting periods use actual NDVI over the selected years.
+# No predicted NDVI is used.
+PERFORMANCE_WINDOWS: Dict[str, Dict[str, object]] = {
+    "Performance_2011_vs_Baseline": {
+        "years": [2009, 2010, 2011],
+        "reporting_year": 2011,
+        "lulc_year": 2011,
+    },
+    "Performance_2022_vs_Baseline": {
+        "years": [2020, 2021, 2022],
+        "reporting_year": 2022,
+        "lulc_year": 2022,
+    },
+}
+
+
+# =============================================================================
+# 2. NDVI AND CLASSIFICATION SETTINGS
+# =============================================================================
+
+NDVI_NODATA = -9999.0
+VALID_NDVI_RANGE = (-0.2, 1.0)
+
+# Avoid invalid or unstable division where baseline NDVI is missing or <= 0.
+BASELINE_DENOMINATOR_EPS = 1e-6
+
+# Minimum number of valid annual/seasonal NDVI observations required in a window.
+# For 3-year windows, 2 means the mean can still be calculated if one year is missing.
+MIN_VALID_OBS_BASELINE = 2
+MIN_VALID_OBS_REPORTING = 2
+
+# Performance thresholds.
+STRONG_LOSS_TH = -10.0
+MODERATE_LOSS_TH = -5.0
+MODERATE_GAIN_TH = 5.0
+STRONG_GAIN_TH = 10.0
+
+PERFORMANCE_CLASS_LABELS = {
+    0: "NoData / not classified",
+    1: "Strong loss (<= -10%)",
+    2: "Moderate loss (> -10% to -5%)",
+    3: "Stable (> -5% to +5%)",
+    4: "Moderate gain (> +5% to +10%)",
+    5: "Strong gain (> +10%)",
+}
+
+
+# =============================================================================
+# 3. PROCESSING SETTINGS
+# =============================================================================
+
+BLOCK_SIZE = 512
+
+COMPRESS = "ZSTD"
+ZSTD_LEVEL = 12
+TILE_SIZE = 512
+
+FLOAT_NODATA = -9999.0
+UINT8_NODATA = 0
+UINT16_NODATA = 0
+
+
+# =============================================================================
+# 4. LULC SETTINGS
+# =============================================================================
+
+LULC_GROUP_LABELS: Dict[int, str] = {
+    1: "Cropland",
+    2: "Cropland mosaic",
+    3: "Natural/cropland mosaic",
+    4: "Tree cover",
+    5: "Shrubland",
+    6: "Grassland",
+    7: "Sparse/bare",
+    8: "Wetland/flooded veg",
+    9: "Urban",
+    10: "Water/snow/ice",
+    11: "Natural vegetation mosaic",
+}
+
+EXCLUDE_LULC_GROUP_LABELS = ["Sparse/bare", "Water/snow/ice"]
+EXCLUDE_LULC_GROUPS = [
+    k for k, v in LULC_GROUP_LABELS.items()
+    if v in EXCLUDE_LULC_GROUP_LABELS
+]
+
+ANALYSIS_LULC_GROUPS = [
+    k for k in LULC_GROUP_LABELS
+    if k not in EXCLUDE_LULC_GROUPS
+]
+
+
+# =============================================================================
+# 5. PATH HELPERS
+# =============================================================================
+
+def _fmt(sec: float) -> str:
+    return str(timedelta(seconds=int(sec)))
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def mkdir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def ndvi_path(year: int) -> Path:
+    return STATE_CACHE_DIR / f"NDVI_mean_assessment_{TIME_TAG}_{year}_EA250m.tif"
+
+
+def lulc_path(year: int) -> Path:
+    return STATE_CACHE_DIR / f"LULC_major_reporting_{year}_EA250m.tif"
+
+
+def ecoregion_id_path() -> Path:
+    return STATE_CACHE_DIR / "Ecoregion_ID_EA250m.tif"
+
+
+def country_id_path() -> Path:
+    return STATE_CACHE_DIR / "Country_ID_EA250m.tif"
+
+
+def get_raster_dir() -> Path:
+    return PERF_OUT_ROOT / "rasters"
+
+
+def get_summary_dir() -> Path:
+    return PERF_OUT_ROOT / "summaries"
+
+
+def get_diagnostic_dir() -> Path:
+    return PERF_OUT_ROOT / "diagnostics"
+
+
+def get_chart_dir() -> Path:
+    return PERF_OUT_ROOT / "charts"
+
+
+def baseline_ndvi_raster_path() -> Path:
+    return get_raster_dir() / f"{PREFIX}_{BASELINE_WINDOW_NAME}_NDVI_mean_{TIME_TAG}_EA250m.tif"
+
+
+def baseline_valid_count_path() -> Path:
+    return get_raster_dir() / f"{PREFIX}_{BASELINE_WINDOW_NAME}_NDVI_valid_count_{TIME_TAG}_EA250m.tif"
+
+
+def reporting_ndvi_raster_path(window_name: str) -> Path:
+    return get_raster_dir() / f"{PREFIX}_{window_name}_NDVI_mean_{TIME_TAG}_EA250m.tif"
+
+
+def reporting_valid_count_path(window_name: str) -> Path:
+    return get_raster_dir() / f"{PREFIX}_{window_name}_NDVI_valid_count_{TIME_TAG}_EA250m.tif"
+
+
+def performance_delta_path(window_name: str) -> Path:
+    return get_raster_dir() / f"{PREFIX}_{window_name}_NDVI_delta_{TIME_TAG}_EA250m.tif"
+
+
+def performance_pct_path(window_name: str) -> Path:
+    return get_raster_dir() / f"{PREFIX}_{window_name}_NDVI_percent_change_{TIME_TAG}_EA250m.tif"
+
+
+def performance_class_path(window_name: str) -> Path:
+    return get_raster_dir() / f"{PREFIX}_{window_name}_Performance_class_5bin_{TIME_TAG}_EA250m.tif"
+
+
+def performance_master_summary_path() -> Path:
+    return PERF_OUT_ROOT / f"{PREFIX}_ALL_Performance_class_summary_{TIME_TAG}.csv"
+
+
+def performance_vegetated_domain_master_path() -> Path:
+    return PERF_OUT_ROOT / f"{PREFIX}_ALL_Performance_class_summary_{TIME_TAG}_VEGETATED_DOMAIN_MASTER.csv"
+
+
+def performance_vegetated_domain_check_path() -> Path:
+    return PERF_OUT_ROOT / f"{PREFIX}_vegetated_domain_master_update_check_{TIME_TAG}.csv"
+
+
+def save_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"[write] {path}")
+
+
+# =============================================================================
+# 6. RASTER PROFILE / WINDOW HELPERS
+# =============================================================================
+
+def iter_windows(width: int, height: int, block_size: int = BLOCK_SIZE):
+    for row_off in range(0, height, block_size):
+        h = min(block_size, height - row_off)
+        for col_off in range(0, width, block_size):
+            w = min(block_size, width - col_off)
+            yield Window(col_off, row_off, w, h)
+
+
+def output_profile_like(src_profile: dict, dtype: str, nodata) -> dict:
+    prof = src_profile.copy()
+    prof.update(
+        driver="GTiff",
+        count=1,
+        dtype=dtype,
+        nodata=nodata,
+        compress=COMPRESS,
+        zstd_level=ZSTD_LEVEL,
+        tiled=True,
+        blockxsize=TILE_SIZE,
+        blockysize=TILE_SIZE,
+        BIGTIFF="IF_SAFER",
+    )
+    return prof
+
+
+def write_float_window(dst, arr: np.ndarray, win: Window) -> None:
+    out = np.where(np.isfinite(arr), arr, FLOAT_NODATA).astype(np.float32)
+    dst.write(out, 1, window=win)
+
+
+def write_uint8_window(dst, arr: np.ndarray, win: Window) -> None:
+    dst.write(arr.astype(np.uint8), 1, window=win)
+
+
+def write_uint16_window(dst, arr: np.ndarray, win: Window) -> None:
+    dst.write(arr.astype(np.uint16), 1, window=win)
+
+
+def validate_alignment(paths: List[Path]) -> dict:
+    if not paths:
+        raise ValueError("No paths provided to validate_alignment().")
+
+    with rasterio.open(paths[0]) as ref:
+        ref_profile = ref.profile.copy()
+        ref_shape = (ref.height, ref.width)
+        ref_crs = ref.crs
+        ref_transform = ref.transform
+
+    for p in paths[1:]:
+        with rasterio.open(p) as src:
+            if (src.height, src.width) != ref_shape:
+                raise ValueError(f"Shape mismatch: {p}")
+            if src.crs != ref_crs:
+                raise ValueError(f"CRS mismatch: {p}")
+            if src.transform != ref_transform:
+                raise ValueError(f"Transform mismatch: {p}")
+
+    return ref_profile
+
+
+def validate_cache_inputs() -> None:
+    required = [
+        ecoregion_id_path(),
+        country_id_path(),
+        lulc_path(BASELINE_LULC_YEAR),
+    ]
+
+    for y in BASELINE_YEARS:
+        required.append(ndvi_path(y))
+
+    for _, info in PERFORMANCE_WINDOWS.items():
+        for y in info["years"]:
+            required.append(ndvi_path(int(y)))
+        required.append(lulc_path(int(info["lulc_year"])))
+
+    missing = [p for p in required if not p.exists()]
+
+    if missing:
+        print("\n[missing inputs]")
+        for p in missing[:40]:
+            print(f"  - {p}")
+        if len(missing) > 40:
+            print(f"  ... and {len(missing) - 40} more")
+        raise FileNotFoundError("Some required State-cache rasters are missing.")
+
+    print("[cache] all required input rasters found.")
+
+
+def get_pixel_area_ha_from_profile(path: Path) -> float:
+    with rasterio.open(path) as src:
+        return abs(src.transform.a * src.transform.e - src.transform.b * src.transform.d) / 10000.0
+
+
+# =============================================================================
+# 7. PERFORMANCE HELPERS
+# =============================================================================
+
+def read_ndvi_window(src, win: Window) -> np.ndarray:
+    """
+    Read one annual State-cache NDVI window.
+
+    Screening is limited to declared/configured NoData and VALID_NDVI_RANGE.
+    No additional MOD13Q1 QA-band filtering is applied here.
+    """
+    arr = src.read(1, window=win).astype(np.float32)
+
+    nd = src.nodata
+    if nd is not None:
+        arr[arr == nd] = np.nan
+
+    arr[arr == NDVI_NODATA] = np.nan
+
+    lo, hi = VALID_NDVI_RANGE
+    arr[(arr < lo) | (arr > hi)] = np.nan
+
+    return arr
+
+
+def compute_window_mean(arrays: List[np.ndarray], min_valid_obs: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate an equal-weight mean across annual NDVI rasters.
+
+    Each valid year contributes one annual-mean NDVI value. Pixels with fewer
+    than `min_valid_obs` valid years are returned as NaN.
+    """
+    stack = np.stack(arrays, axis=0)
+    valid = np.isfinite(stack)
+
+    count = valid.sum(axis=0).astype(np.uint16)
+
+    sums = np.nansum(stack, axis=0).astype(np.float32)
+    mean = np.full(stack.shape[1:], np.nan, dtype=np.float32)
+
+    ok = count >= min_valid_obs
+    mean[ok] = (sums[ok] / count[ok]).astype(np.float32)
+
+    return mean, count
+
+
+def classify_percent_change(pct: np.ndarray) -> np.ndarray:
+    """
+    Convert observed relative NDVI change (%) to the five production classes.
+
+    These are magnitude classes only; no Trend significance test is applied.
+    """
+    cls = np.zeros(pct.shape, dtype=np.uint8)
+
+    valid = np.isfinite(pct)
+
+    cls[valid & (pct <= STRONG_LOSS_TH)] = 1
+    cls[valid & (pct > STRONG_LOSS_TH) & (pct <= MODERATE_LOSS_TH)] = 2
+    cls[valid & (pct > MODERATE_LOSS_TH) & (pct <= MODERATE_GAIN_TH)] = 3
+    cls[valid & (pct > MODERATE_GAIN_TH) & (pct <= STRONG_GAIN_TH)] = 4
+    cls[valid & (pct > STRONG_GAIN_TH)] = 5
+
+    return cls
+
+
+def _raster_exists_readable(path: Path) -> bool:
+    """
+    Return True only for an existing, non-empty, readable one-band raster.
+
+    The check does not inspect or modify pixel values. It is used only to avoid
+    treating a truncated or corrupt output as a completed Performance product.
+    """
+    if not (path.exists() and path.is_file() and path.stat().st_size > 0):
+        return False
+
+    try:
+        with rasterio.open(path) as src:
+            return (
+                src.count == 1
+                and src.width > 0
+                and src.height > 0
+                and src.crs is not None
+            )
+    except Exception:
+        return False
+
+
+def performance_rasters_complete(window_name: str) -> bool:
+    """
+    Check the full reusable output set required for one reporting window.
+
+    Baseline outputs are shared across reporting windows and are therefore
+    included in each completion check.
+    """
+    core = [
+        baseline_ndvi_raster_path(),
+        baseline_valid_count_path(),
+        reporting_ndvi_raster_path(window_name),
+        reporting_valid_count_path(window_name),
+        performance_delta_path(window_name),
+        performance_pct_path(window_name),
+        performance_class_path(window_name),
+    ]
+    return all(_raster_exists_readable(p) for p in core)
+
+
+# =============================================================================
+# 8. BUILD CONTINENTAL PERFORMANCE RASTERS
+# =============================================================================
+
+def build_performance_rasters() -> None:
+    mkdir(get_raster_dir())
+    mkdir(get_diagnostic_dir())
+    mkdir(get_chart_dir())
+
+    # The baseline raster is shared by all reporting windows. If every expected
+    # reusable output is already complete, reuse the existing production set.
+    # If any window is incomplete, rebuild the complete shared-baseline set so
+    # all outputs remain internally consistent.
+    if REUSE_EXISTING_PERFORMANCE_RASTERS and not FORCE_REBUILD_PERFORMANCE_RASTERS:
+        incomplete_windows = [
+            window_name
+            for window_name in PERFORMANCE_WINDOWS
+            if not performance_rasters_complete(window_name)
+        ]
+
+        if not incomplete_windows:
+            print("[reuse] all Performance raster products already exist and are readable; skipping rebuild.")
+            return
+
+        print(
+            "[reuse-check] Performance raster set is incomplete; rebuilding the "
+            "shared baseline and all reporting windows."
+        )
+        print(f"[reuse-check] incomplete windows: {incomplete_windows}")
+
+    print("\n" + "=" * 100)
+    print("[performance] building continental performance rasters")
+    print("=" * 100)
+    print(f"[baseline] {BASELINE_WINDOW_NAME}: {BASELINE_YEARS}")
+
+    all_ndvi_paths = [ndvi_path(y) for y in BASELINE_YEARS]
+
+    for info in PERFORMANCE_WINDOWS.values():
+        all_ndvi_paths.extend([ndvi_path(int(y)) for y in info["years"]])
+
+    template_profile = validate_alignment(all_ndvi_paths + [ecoregion_id_path(), country_id_path()])
+
+    width = template_profile["width"]
+    height = template_profile["height"]
+
+    print(f"[performance] raster size: {width:,} × {height:,}")
+    print(f"[performance] baseline years: {BASELINE_YEARS}")
+
+    manifest_rows = []
+
+    float_profile = output_profile_like(template_profile, "float32", FLOAT_NODATA)
+    uint8_profile = output_profile_like(template_profile, "uint8", UINT8_NODATA)
+    uint16_profile = output_profile_like(template_profile, "uint16", UINT16_NODATA)
+
+    with ExitStack() as stack:
+        baseline_srcs = [
+            stack.enter_context(rasterio.open(ndvi_path(y)))
+            for y in BASELINE_YEARS
+        ]
+
+        reporting_srcs = {
+            window_name: [
+                stack.enter_context(rasterio.open(ndvi_path(int(y))))
+                for y in info["years"]
+            ]
+            for window_name, info in PERFORMANCE_WINDOWS.items()
+        }
+
+        dst_baseline = stack.enter_context(
+            rasterio.open(baseline_ndvi_raster_path(), "w", **float_profile)
+        )
+        dst_baseline_count = stack.enter_context(
+            rasterio.open(baseline_valid_count_path(), "w", **uint16_profile)
+        )
+
+        manifest_rows.append({
+            "type": "baseline",
+            "metric": "NDVI_mean",
+            "window": BASELINE_WINDOW_NAME,
+            "years": ",".join(map(str, BASELINE_YEARS)),
+            "path": str(baseline_ndvi_raster_path()),
+        })
+        manifest_rows.append({
+            "type": "baseline",
+            "metric": "NDVI_valid_count",
+            "window": BASELINE_WINDOW_NAME,
+            "years": ",".join(map(str, BASELINE_YEARS)),
+            "path": str(baseline_valid_count_path()),
+        })
+
+        dsts = {}
+
+        for window_name, info in PERFORMANCE_WINDOWS.items():
+            dsts[(window_name, "reporting_mean")] = stack.enter_context(
+                rasterio.open(reporting_ndvi_raster_path(window_name), "w", **float_profile)
+            )
+            dsts[(window_name, "reporting_count")] = stack.enter_context(
+                rasterio.open(reporting_valid_count_path(window_name), "w", **uint16_profile)
+            )
+            dsts[(window_name, "delta")] = stack.enter_context(
+                rasterio.open(performance_delta_path(window_name), "w", **float_profile)
+            )
+            dsts[(window_name, "pct")] = stack.enter_context(
+                rasterio.open(performance_pct_path(window_name), "w", **float_profile)
+            )
+            dsts[(window_name, "class")] = stack.enter_context(
+                rasterio.open(performance_class_path(window_name), "w", **uint8_profile)
+            )
+
+            manifest_rows.extend([
+                {
+                    "type": "reporting",
+                    "metric": "NDVI_mean",
+                    "window": window_name,
+                    "years": ",".join(map(str, info["years"])),
+                    "reporting_year": info["reporting_year"],
+                    "lulc_year": info["lulc_year"],
+                    "path": str(reporting_ndvi_raster_path(window_name)),
+                },
+                {
+                    "type": "reporting",
+                    "metric": "NDVI_valid_count",
+                    "window": window_name,
+                    "years": ",".join(map(str, info["years"])),
+                    "reporting_year": info["reporting_year"],
+                    "lulc_year": info["lulc_year"],
+                    "path": str(reporting_valid_count_path(window_name)),
+                },
+                {
+                    "type": "performance",
+                    "metric": "NDVI_delta",
+                    "window": window_name,
+                    "path": str(performance_delta_path(window_name)),
+                },
+                {
+                    "type": "performance",
+                    "metric": "NDVI_percent_change",
+                    "window": window_name,
+                    "path": str(performance_pct_path(window_name)),
+                },
+                {
+                    "type": "performance",
+                    "metric": "Performance_class_5bin",
+                    "window": window_name,
+                    "path": str(performance_class_path(window_name)),
+                },
+            ])
+
+        windows = list(iter_windows(width, height, BLOCK_SIZE))
+        t0 = time.perf_counter()
+
+        for i, win in enumerate(windows, start=1):
+            baseline_arrays = [
+                read_ndvi_window(src, win)
+                for src in baseline_srcs
+            ]
+            baseline_mean, baseline_count = compute_window_mean(
+                baseline_arrays,
+                MIN_VALID_OBS_BASELINE,
+            )
+
+            write_float_window(dst_baseline, baseline_mean, win)
+            write_uint16_window(dst_baseline_count, baseline_count, win)
+
+            for window_name, srcs in reporting_srcs.items():
+                reporting_arrays = [
+                    read_ndvi_window(src, win)
+                    for src in srcs
+                ]
+
+                reporting_mean, reporting_count = compute_window_mean(
+                    reporting_arrays,
+                    MIN_VALID_OBS_REPORTING,
+                )
+
+                delta = reporting_mean - baseline_mean
+
+                valid = (
+                    np.isfinite(reporting_mean)
+                    & np.isfinite(baseline_mean)
+                    & (baseline_mean > BASELINE_DENOMINATOR_EPS)
+                )
+
+                # Production Performance definition: observed relative change
+                # between the reporting-window and fixed baseline-window means.
+                # No Trend prediction or significance statistic enters this value.
+                pct = np.full(reporting_mean.shape, np.nan, dtype=np.float32)
+                pct[valid] = (
+                    delta[valid] / baseline_mean[valid] * 100.0
+                ).astype(np.float32)
+
+                cls = classify_percent_change(pct)
+
+                write_float_window(dsts[(window_name, "reporting_mean")], reporting_mean, win)
+                write_uint16_window(dsts[(window_name, "reporting_count")], reporting_count, win)
+                write_float_window(dsts[(window_name, "delta")], delta, win)
+                write_float_window(dsts[(window_name, "pct")], pct, win)
+                write_uint8_window(dsts[(window_name, "class")], cls, win)
+
+            if i % 50 == 0 or i == len(windows):
+                print(
+                    f"[performance] {i:,}/{len(windows):,} windows | "
+                    f"elapsed {_fmt(time.perf_counter() - t0)}"
+                )
+
+    save_csv(
+        pd.DataFrame(manifest_rows),
+        get_diagnostic_dir() / f"{PREFIX}_output_manifest_{TIME_TAG}.csv",
+    )
+
+    print("[performance] raster building complete")
+
+
+# =============================================================================
+# 9. SUMMARY TABLES
+# =============================================================================
+
+def update_class_accumulator(
+    acc,
+    group_cols,
+    group_arrays,
+    class_arr,
+    valid,
+    pixel_area_ha,
+    window_name,
+    summary_level,
+):
+    if not np.any(valid):
+        return
+
+    data = {
+        col: arr[valid].ravel()
+        for col, arr in zip(group_cols, group_arrays)
+    }
+
+    data["performance_class"] = class_arr[valid].astype(np.uint8).ravel()
+
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        return
+
+    grouped = (
+        df
+        .groupby(group_cols + ["performance_class"], dropna=False)
+        .size()
+        .reset_index(name="pixel_count")
+    )
+
+    for _, r in grouped.iterrows():
+        cls = int(r["performance_class"])
+
+        if cls == 0:
+            continue
+
+        key = (
+            window_name,
+            summary_level,
+            *[int(r[c]) for c in group_cols],
+            cls,
+        )
+
+        if key not in acc:
+            acc[key] = {"pixels": 0.0}
+
+        acc[key]["pixels"] += float(r["pixel_count"])
+
+
+def update_ndvi_mean_accumulator(
+    acc,
+    group_cols,
+    group_arrays,
+    ndvi_arr,
+    valid,
+    pixel_area_ha,
+    summary_name,
+    summary_level,
+):
+    if not np.any(valid):
+        return
+
+    data = {
+        col: arr[valid].ravel()
+        for col, arr in zip(group_cols, group_arrays)
+    }
+    data["ndvi"] = ndvi_arr[valid].astype(np.float32).ravel()
+
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        return
+
+    grouped = (
+        df
+        .groupby(group_cols, dropna=False)["ndvi"]
+        .agg(["count", "mean", "min", "max"])
+        .reset_index()
+    )
+
+    for _, r in grouped.iterrows():
+        key = (
+            summary_name,
+            summary_level,
+            *[int(r[c]) for c in group_cols],
+        )
+
+        if key not in acc:
+            acc[key] = {
+                "pixel_count": 0.0,
+                "sum_ndvi": 0.0,
+                "min_ndvi": np.inf,
+                "max_ndvi": -np.inf,
+                "median_note": "median not accumulated across windows; see mean/min/max",
+            }
+
+        count = float(r["count"])
+        acc[key]["pixel_count"] += count
+        acc[key]["sum_ndvi"] += float(r["mean"]) * count
+        acc[key]["min_ndvi"] = min(acc[key]["min_ndvi"], float(r["min"]))
+        acc[key]["max_ndvi"] = max(acc[key]["max_ndvi"], float(r["max"]))
+
+
+def summarise_performance() -> None:
+    print("\n" + "=" * 100)
+    print("[summary] summarising performance rasters")
+    print("=" * 100)
+
+    base_class = next(iter(PERFORMANCE_WINDOWS.keys()))
+    base_raster = performance_class_path(base_class)
+
+    if not base_raster.exists():
+        raise FileNotFoundError(
+            f"Cannot summarise. Missing performance class raster: {base_raster}"
+        )
+
+    with rasterio.open(base_raster) as tmp:
+        width, height = tmp.width, tmp.height
+
+    pixel_ha = get_pixel_area_ha_from_profile(base_raster)
+
+    class_acc = {}
+    ndvi_acc = {}
+
+    with ExitStack() as stack:
+        eco_src = stack.enter_context(rasterio.open(ecoregion_id_path()))
+        country_src = stack.enter_context(rasterio.open(country_id_path()))
+
+        baseline_lulc_src = stack.enter_context(rasterio.open(lulc_path(BASELINE_LULC_YEAR)))
+        baseline_ndvi_src = stack.enter_context(rasterio.open(baseline_ndvi_raster_path()))
+
+        class_srcs = {
+            window_name: stack.enter_context(rasterio.open(performance_class_path(window_name)))
+            for window_name in PERFORMANCE_WINDOWS
+            if performance_class_path(window_name).exists()
+        }
+
+        reporting_lulc_srcs = {
+            window_name: stack.enter_context(rasterio.open(lulc_path(int(info["lulc_year"]))))
+            for window_name, info in PERFORMANCE_WINDOWS.items()
+        }
+
+        reporting_ndvi_srcs = {
+            window_name: stack.enter_context(rasterio.open(reporting_ndvi_raster_path(window_name)))
+            for window_name in PERFORMANCE_WINDOWS
+            if reporting_ndvi_raster_path(window_name).exists()
+        }
+
+        windows = list(iter_windows(width, height, BLOCK_SIZE))
+        t0 = time.perf_counter()
+
+        for i, win in enumerate(windows, start=1):
+            eco = eco_src.read(1, window=win).astype(np.int32)
+            country = country_src.read(1, window=win).astype(np.int32)
+
+            valid_eco = eco > 0
+            valid_country = valid_eco & (country > 0)
+
+            # Baseline NDVI summaries using LULC 2001.
+            baseline_lulc = baseline_lulc_src.read(1, window=win).astype(np.uint8)
+            baseline_ndvi = baseline_ndvi_src.read(1, window=win).astype(np.float32)
+            baseline_ndvi[baseline_ndvi == FLOAT_NODATA] = np.nan
+
+            valid_baseline_ndvi = valid_eco & np.isfinite(baseline_ndvi)
+            valid_baseline_lulc = valid_baseline_ndvi & np.isin(baseline_lulc, ANALYSIS_LULC_GROUPS)
+
+            update_ndvi_mean_accumulator(
+                ndvi_acc,
+                ["ECO_ID"],
+                [eco],
+                baseline_ndvi,
+                valid_baseline_ndvi,
+                pixel_ha,
+                BASELINE_WINDOW_NAME,
+                "baseline_ecoregion",
+            )
+
+            update_ndvi_mean_accumulator(
+                ndvi_acc,
+                ["ECO_ID", "COUNTRY_ID"],
+                [eco, country],
+                baseline_ndvi,
+                valid_baseline_ndvi & (country > 0),
+                pixel_ha,
+                BASELINE_WINDOW_NAME,
+                "baseline_ecoregion_country",
+            )
+
+            update_ndvi_mean_accumulator(
+                ndvi_acc,
+                ["ECO_ID", "LULC_group"],
+                [eco, baseline_lulc],
+                baseline_ndvi,
+                valid_baseline_lulc,
+                pixel_ha,
+                BASELINE_WINDOW_NAME,
+                "baseline_ecoregion_lulc_2001",
+            )
+
+            update_ndvi_mean_accumulator(
+                ndvi_acc,
+                ["ECO_ID", "COUNTRY_ID", "LULC_group"],
+                [eco, country, baseline_lulc],
+                baseline_ndvi,
+                valid_baseline_lulc & (country > 0),
+                pixel_ha,
+                BASELINE_WINDOW_NAME,
+                "baseline_ecoregion_country_lulc_2001",
+            )
+
+            # Performance class summaries by reporting-year LULC.
+            for window_name, class_src in class_srcs.items():
+                cls = class_src.read(1, window=win).astype(np.uint8)
+                reporting_lulc = reporting_lulc_srcs[window_name].read(1, window=win).astype(np.uint8)
+
+                valid_class = valid_eco & (cls > 0)
+                valid_class_country = valid_class & (country > 0)
+                valid_class_lulc = valid_class & np.isin(reporting_lulc, ANALYSIS_LULC_GROUPS)
+
+                update_class_accumulator(
+                    class_acc,
+                    ["ECO_ID"],
+                    [eco],
+                    cls,
+                    valid_class,
+                    pixel_ha,
+                    window_name,
+                    "ecoregion",
+                )
+
+                update_class_accumulator(
+                    class_acc,
+                    ["COUNTRY_ID"],
+                    [country],
+                    cls,
+                    valid_class_country,
+                    pixel_ha,
+                    window_name,
+                    "country",
+                )
+
+                update_class_accumulator(
+                    class_acc,
+                    ["ECO_ID", "COUNTRY_ID"],
+                    [eco, country],
+                    cls,
+                    valid_class_country,
+                    pixel_ha,
+                    window_name,
+                    "ecoregion_country",
+                )
+
+                update_class_accumulator(
+                    class_acc,
+                    ["ECO_ID", "LULC_group"],
+                    [eco, reporting_lulc],
+                    cls,
+                    valid_class_lulc,
+                    pixel_ha,
+                    window_name,
+                    f"ecoregion_lulc_{PERFORMANCE_WINDOWS[window_name]['lulc_year']}",
+                )
+
+                update_class_accumulator(
+                    class_acc,
+                    ["ECO_ID", "COUNTRY_ID", "LULC_group"],
+                    [eco, country, reporting_lulc],
+                    cls,
+                    valid_class_lulc & (country > 0),
+                    pixel_ha,
+                    window_name,
+                    f"ecoregion_country_lulc_{PERFORMANCE_WINDOWS[window_name]['lulc_year']}",
+                )
+
+                reporting_ndvi = reporting_ndvi_srcs[window_name].read(1, window=win).astype(np.float32)
+                reporting_ndvi[reporting_ndvi == FLOAT_NODATA] = np.nan
+                valid_reporting_ndvi = valid_eco & np.isfinite(reporting_ndvi)
+                valid_reporting_lulc = valid_reporting_ndvi & np.isin(reporting_lulc, ANALYSIS_LULC_GROUPS)
+
+                update_ndvi_mean_accumulator(
+                    ndvi_acc,
+                    ["ECO_ID", "LULC_group"],
+                    [eco, reporting_lulc],
+                    reporting_ndvi,
+                    valid_reporting_lulc,
+                    pixel_ha,
+                    window_name,
+                    f"reporting_ecoregion_lulc_{PERFORMANCE_WINDOWS[window_name]['lulc_year']}",
+                )
+
+                update_ndvi_mean_accumulator(
+                    ndvi_acc,
+                    ["ECO_ID", "COUNTRY_ID", "LULC_group"],
+                    [eco, country, reporting_lulc],
+                    reporting_ndvi,
+                    valid_reporting_lulc & (country > 0),
+                    pixel_ha,
+                    window_name,
+                    f"reporting_ecoregion_country_lulc_{PERFORMANCE_WINDOWS[window_name]['lulc_year']}",
+                )
+
+            if i % 100 == 0 or i == len(windows):
+                print(
+                    f"[summary] {i:,}/{len(windows):,} windows | "
+                    f"elapsed {_fmt(time.perf_counter() - t0)}"
+                )
+
+    # Convert class accumulator to dataframe.
+    class_rows = []
+
+    for key, vals in class_acc.items():
+        window_name, level, *group_values, cls = key
+
+        row = {
+            "performance_window": window_name,
+            "time_tag": TIME_TAG,
+            "summary_level": level,
+            "performance_class": int(cls),
+            "performance_class_label": PERFORMANCE_CLASS_LABELS.get(int(cls), ""),
+            "area_ha": vals["pixels"] * pixel_ha,
+        }
+
+        if level == "ecoregion":
+            row["ECO_ID"] = group_values[0]
+        elif level == "country":
+            row["COUNTRY_ID"] = group_values[0]
+        elif level == "ecoregion_country":
+            row["ECO_ID"], row["COUNTRY_ID"] = group_values
+        elif level.startswith("ecoregion_lulc"):
+            row["ECO_ID"], row["LULC_group"] = group_values
+        elif level.startswith("ecoregion_country_lulc"):
+            row["ECO_ID"], row["COUNTRY_ID"], row["LULC_group"] = group_values
+
+        class_rows.append(row)
+
+    class_df = pd.DataFrame(class_rows)
+
+    if not class_df.empty:
+        group_cols = [
+            c for c in [
+                "performance_window",
+                "summary_level",
+                "ECO_ID",
+                "COUNTRY_ID",
+                "LULC_group",
+            ]
+            if c in class_df.columns
+        ]
+
+        total_df = (
+            class_df
+            .groupby(group_cols, dropna=False)["area_ha"]
+            .sum()
+            .reset_index(name="total_classified_ha")
+        )
+
+        class_df = class_df.merge(total_df, on=group_cols, how="left")
+        class_df["area_pct"] = np.where(
+            class_df["total_classified_ha"] > 0,
+            class_df["area_ha"] / class_df["total_classified_ha"] * 100.0,
+            0.0,
+        )
+
+    # Convert NDVI accumulator to dataframe.
+    ndvi_rows = []
+
+    for key, vals in ndvi_acc.items():
+        summary_name, level, *group_values = key
+
+        count = vals["pixel_count"]
+        mean_ndvi = vals["sum_ndvi"] / count if count > 0 else np.nan
+
+        row = {
+            "summary_name": summary_name,
+            "time_tag": TIME_TAG,
+            "summary_level": level,
+            "pixel_count": count,
+            "area_ha": count * pixel_ha,
+            "mean_ndvi": mean_ndvi,
+            "min_ndvi": vals["min_ndvi"],
+            "max_ndvi": vals["max_ndvi"],
+            "note": vals["median_note"],
+        }
+
+        if level == "baseline_ecoregion":
+            row["ECO_ID"] = group_values[0]
+        elif level == "baseline_ecoregion_country":
+            row["ECO_ID"], row["COUNTRY_ID"] = group_values
+        elif level == "baseline_ecoregion_lulc_2001":
+            row["ECO_ID"], row["LULC_group"] = group_values
+        elif level == "baseline_ecoregion_country_lulc_2001":
+            row["ECO_ID"], row["COUNTRY_ID"], row["LULC_group"] = group_values
+        elif level.startswith("reporting_ecoregion_lulc"):
+            row["ECO_ID"], row["LULC_group"] = group_values
+        elif level.startswith("reporting_ecoregion_country_lulc"):
+            row["ECO_ID"], row["COUNTRY_ID"], row["LULC_group"] = group_values
+
+        ndvi_rows.append(row)
+
+    ndvi_df = pd.DataFrame(ndvi_rows)
+
+    # Add labels.
+    eco_lookup_path = LOOKUP_DIR / "ecoregion_lookup.csv"
+    country_lookup_path = LOOKUP_DIR / "country_lookup.csv"
+
+    for df_name, df in [("class", class_df), ("ndvi", ndvi_df)]:
+        if df.empty:
+            continue
+
+        if "ECO_ID" in df.columns and eco_lookup_path.exists():
+            df2 = df.merge(pd.read_csv(eco_lookup_path), on="ECO_ID", how="left")
+        else:
+            df2 = df
+
+        if "COUNTRY_ID" in df2.columns and country_lookup_path.exists():
+            df2 = df2.merge(pd.read_csv(country_lookup_path), on="COUNTRY_ID", how="left")
+
+        if "LULC_group" in df2.columns:
+            df2["LULC_label"] = df2["LULC_group"].map(LULC_GROUP_LABELS)
+
+        if df_name == "class":
+            class_df = df2
+        else:
+            ndvi_df = df2
+
+    save_csv(
+        class_df,
+        get_summary_dir() / f"{PREFIX}_performance_class_summary_{TIME_TAG}.csv",
+    )
+
+    save_csv(
+        ndvi_df,
+        get_summary_dir() / f"{PREFIX}_ndvi_window_summary_{TIME_TAG}.csv",
+    )
+
+    if not class_df.empty:
+        save_csv(class_df, performance_master_summary_path())
+
+    return class_df, ndvi_df
+
+
+
+# =============================================================================
+# 10. VEGETATED-DOMAIN MASTER SUMMARY
+# =============================================================================
+
+def _to_numeric_clean(series: pd.Series) -> pd.Series:
+    """
+    Robust numeric conversion in case a CSV has been opened/saved with commas.
+    """
+    if series.dtype == object:
+        return pd.to_numeric(
+            series.astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+    return pd.to_numeric(series, errors="coerce")
+
+
+def clean_performance_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    for col in [
+        "performance_class",
+        "area_ha",
+        "ECO_ID",
+        "COUNTRY_ID",
+        "LULC_group",
+        "total_classified_ha",
+        "area_pct",
+        "ECO_NAME_CODE",
+    ]:
+        if col in out.columns:
+            out[col] = _to_numeric_clean(out[col])
+
+    return out
+
+
+def ensure_all_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out[columns]
+
+
+def rebuild_performance_level_from_lulc(
+    src: pd.DataFrame,
+    level_name: str,
+    group_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Rebuild one broad Performance summary level from reporting-year LULC rows.
+
+    This is used to make country, ecoregion and ecoregion_country summaries
+    comparable with State by using only the retained vegetated / analysis-relevant
+    LULC domain as the denominator.
+    """
+    if src.empty:
+        return pd.DataFrame()
+
+    required = set(group_cols + ["area_ha"])
+    missing = [c for c in required if c not in src.columns]
+    if missing:
+        raise ValueError(f"Cannot rebuild {level_name}. Missing columns: {missing}")
+
+    grouped = (
+        src.groupby(group_cols, dropna=False, as_index=False)["area_ha"]
+        .sum()
+    )
+
+    grouped["summary_level"] = level_name
+    grouped["performance_class_label"] = grouped["performance_class"].map(PERFORMANCE_CLASS_LABELS)
+
+    # Broad levels are not single-LULC rows.
+    grouped["LULC_group"] = np.nan
+    grouped["LULC_label"] = pd.NA
+
+    # The denominator is the total retained LULC area for this reporting unit/window.
+    denom_cols = [c for c in group_cols if c != "performance_class"]
+
+    denom = (
+        grouped.groupby(denom_cols, dropna=False, as_index=False)["area_ha"]
+        .sum()
+        .rename(columns={"area_ha": "total_classified_ha"})
+    )
+
+    out = grouped.merge(denom, on=denom_cols, how="left")
+
+    out["area_pct"] = np.where(
+        out["total_classified_ha"] > 0,
+        out["area_ha"] / out["total_classified_ha"] * 100.0,
+        0.0,
+    )
+
+    return out
+
+
+def make_vegetated_domain_master_summary(class_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a sidecar master CSV where broad Performance summary levels use the
+    retained vegetated / analysis-relevant LULC domain.
+
+    The original master CSV remains unchanged. Only these levels are rebuilt:
+        - ecoregion
+        - country
+        - ecoregion_country
+
+    Source rows:
+        - ecoregion_country_lulc_2011 for Performance_2011_vs_Baseline
+        - ecoregion_country_lulc_2022 for Performance_2022_vs_Baseline
+
+    LULC-level rows are kept unchanged.
+    """
+    if class_df.empty:
+        print("[vegetated-domain] class summary is empty; cannot build sidecar.")
+        return class_df
+
+    df = clean_performance_numeric_columns(class_df)
+    original_cols = list(df.columns)
+
+    existing_path = performance_vegetated_domain_master_path()
+    if (
+        REUSE_EXISTING_VEGETATED_DOMAIN_MASTER
+        and existing_path.exists()
+    ):
+        print(f"[vegetated-domain] reusing existing sidecar: {existing_path}")
+        return pd.read_csv(existing_path)
+
+    window_to_lulc_summary = {
+        "Performance_2011_vs_Baseline": "ecoregion_country_lulc_2011",
+        "Performance_2022_vs_Baseline": "ecoregion_country_lulc_2022",
+    }
+
+    levels_to_replace = ["ecoregion", "country", "ecoregion_country"]
+    keep_df = df[~df["summary_level"].astype(str).isin(levels_to_replace)].copy()
+
+    rebuilt_parts = []
+    check_rows = []
+
+    for win, lulc_level in window_to_lulc_summary.items():
+        src = df[
+            (df["performance_window"].astype(str) == win)
+            & (df["summary_level"].astype(str) == lulc_level)
+        ].copy()
+
+        if src.empty:
+            print(f"[vegetated-domain warning] no source rows for {win} / {lulc_level}; skipping.")
+            continue
+
+        print(f"[vegetated-domain] rebuilding broad levels for {win} from {lulc_level}: {len(src):,} rows")
+
+        eco_country = rebuild_performance_level_from_lulc(
+            src,
+            "ecoregion_country",
+            [
+                "performance_window", "time_tag",
+                "ECO_ID", "COUNTRY_ID", "ECO_NAME_CODE", "ECO_NAME", "ISO_A3",
+                "performance_class",
+            ],
+        )
+
+        country = rebuild_performance_level_from_lulc(
+            src,
+            "country",
+            [
+                "performance_window", "time_tag",
+                "COUNTRY_ID", "ISO_A3",
+                "performance_class",
+            ],
+        )
+
+        ecoregion = rebuild_performance_level_from_lulc(
+            src,
+            "ecoregion",
+            [
+                "performance_window", "time_tag",
+                "ECO_ID", "ECO_NAME_CODE", "ECO_NAME",
+                "performance_class",
+            ],
+        )
+
+        rebuilt_parts.extend([ecoregion, country, eco_country])
+
+        # Diagnostic check: old broad denominator vs new retained-domain denominator.
+        old_country_total = (
+            df[
+                (df["performance_window"].astype(str) == win)
+                & (df["summary_level"].astype(str) == "country")
+            ]
+            .drop_duplicates(subset=["performance_window", "COUNTRY_ID", "total_classified_ha"])
+            ["total_classified_ha"]
+            .sum()
+        )
+        new_country_total = (
+            country
+            .drop_duplicates(subset=["performance_window", "COUNTRY_ID", "total_classified_ha"])
+            ["total_classified_ha"]
+            .sum()
+        )
+
+        old_eco_total = (
+            df[
+                (df["performance_window"].astype(str) == win)
+                & (df["summary_level"].astype(str) == "ecoregion")
+            ]
+            .drop_duplicates(subset=["performance_window", "ECO_ID", "total_classified_ha"])
+            ["total_classified_ha"]
+            .sum()
+        )
+        new_eco_total = (
+            ecoregion
+            .drop_duplicates(subset=["performance_window", "ECO_ID", "total_classified_ha"])
+            ["total_classified_ha"]
+            .sum()
+        )
+
+        check_rows.extend([
+            {
+                "performance_window": win,
+                "summary_level": "country",
+                "old_full_domain_total_ha": old_country_total,
+                "new_vegetated_domain_total_ha": new_country_total,
+                "difference_ha": old_country_total - new_country_total,
+                "new_as_pct_of_old": (
+                    new_country_total / old_country_total * 100.0
+                    if old_country_total > 0 else np.nan
+                ),
+            },
+            {
+                "performance_window": win,
+                "summary_level": "ecoregion",
+                "old_full_domain_total_ha": old_eco_total,
+                "new_vegetated_domain_total_ha": new_eco_total,
+                "difference_ha": old_eco_total - new_eco_total,
+                "new_as_pct_of_old": (
+                    new_eco_total / old_eco_total * 100.0
+                    if old_eco_total > 0 else np.nan
+                ),
+            },
+        ])
+
+    if not rebuilt_parts:
+        print("[vegetated-domain warning] no broad levels were rebuilt; returning original class_df.")
+        return class_df
+
+    rebuilt_df = pd.concat(rebuilt_parts, ignore_index=True)
+    rebuilt_df = ensure_all_columns(rebuilt_df, original_cols)
+
+    updated = pd.concat([keep_df, rebuilt_df], ignore_index=True)
+
+    sort_cols = [
+        c for c in [
+            "performance_window",
+            "summary_level",
+            "ECO_ID",
+            "COUNTRY_ID",
+            "LULC_group",
+            "performance_class",
+        ]
+        if c in updated.columns
+    ]
+    updated = updated.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+    updated = ensure_all_columns(updated, original_cols)
+
+    save_csv(updated, performance_vegetated_domain_master_path())
+
+    if SAVE_VEGETATED_DOMAIN_CHECK_TABLE:
+        check_df = pd.DataFrame(check_rows)
+        save_csv(check_df, performance_vegetated_domain_check_path())
+        print("[vegetated-domain check]")
+        print(check_df.to_string(index=False))
+
+    return updated
+
+
+# =============================================================================
+# 11. CHARTS
+# =============================================================================
+
+def _save_plot(fig, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[write] {path}")
+
+
+def _pivot_class_area(df: pd.DataFrame, index_cols: list[str]) -> pd.DataFrame:
+    """
+    Pivot performance-class area using numeric class codes.
+
+    This avoids blank charts caused by small differences in
+    performance_class_label text.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp["performance_class"] = pd.to_numeric(
+        tmp["performance_class"],
+        errors="coerce"
+    ).astype("Int64")
+
+    out = (
+        tmp.pivot_table(
+            index=index_cols,
+            columns="performance_class",
+            values="area_ha",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .reset_index()
+    )
+
+    for c in [1, 2, 3, 4, 5]:
+        if c not in out.columns:
+            out[c] = 0.0
+
+    out = out[index_cols + [1, 2, 3, 4, 5]]
+    out = out.rename(columns={c: PERFORMANCE_CLASS_LABELS[c] for c in [1, 2, 3, 4, 5]})
+    return out
+
+
+def make_performance_charts(class_df: pd.DataFrame, ndvi_df: pd.DataFrame) -> None:
+    chart_dir = mkdir(get_chart_dir())
+
+    if class_df.empty:
+        print("[charts] class summary is empty; skipping charts.")
+        return
+
+    # 1) Continental total area by performance class and window.
+    df1 = class_df[class_df["summary_level"] == "ecoregion"].copy()
+    if not df1.empty:
+        p1 = _pivot_class_area(df1, ["performance_window"])
+        p1 = p1.set_index("performance_window") / 1_000_000.0
+        fig, ax = plt.subplots(figsize=(10, 6))
+        p1.plot(kind="bar", stacked=True, ax=ax)
+        ax.set_ylabel("Area (million ha)")
+        ax.set_xlabel("Performance window")
+        ax.set_title("Continental performance class area by window")
+        ax.legend(title="Performance class", bbox_to_anchor=(1.02, 1), loc="upper left")
+        plt.xticks(rotation=0)
+        _save_plot(fig, chart_dir / f"{PREFIX}_01_continental_class_area_{TIME_TAG}.png")
+
+    # 2) Continental percent by LULC group and window.
+    df2 = class_df[class_df["summary_level"].astype(str).str.startswith("ecoregion_lulc_")].copy()
+    if not df2.empty and "LULC_label" in df2.columns:
+        for win in sorted(df2["performance_window"].dropna().unique()):
+            sub = df2[df2["performance_window"] == win].copy()
+            p2 = _pivot_class_area(sub, ["LULC_label"]).set_index("LULC_label")
+            p2 = p2.div(p2.sum(axis=1).replace(0, np.nan), axis=0) * 100.0
+            p2 = p2.fillna(0.0)
+            fig, ax = plt.subplots(figsize=(11, 7))
+            p2.plot(kind="bar", stacked=True, ax=ax)
+            ax.set_ylabel("Area share (%)")
+            ax.set_xlabel("LULC group")
+            ax.set_title(f"Performance class composition by LULC group — {win}")
+            ax.legend(title="Performance class", bbox_to_anchor=(1.02, 1), loc="upper left")
+            plt.xticks(rotation=45, ha="right")
+            _save_plot(fig, chart_dir / f"{PREFIX}_02_lulc_class_share_{win}_{TIME_TAG}.png")
+
+    # 3) Top ecoregions by strong loss area.
+    df3 = class_df[
+        (class_df["summary_level"] == "ecoregion")
+        & (class_df["performance_class"] == 1)
+    ].copy()
+    if not df3.empty:
+        for win in sorted(df3["performance_window"].dropna().unique()):
+            sub = df3[df3["performance_window"] == win].copy()
+            sub = sub.sort_values("area_ha", ascending=False).head(TOP_N_ECOREGIONS)
+            if not sub.empty:
+                labels = sub["ECO_NAME"] if "ECO_NAME" in sub.columns else sub["ECO_ID"].astype(str)
+                fig, ax = plt.subplots(figsize=(10, 8))
+                ax.barh(labels.astype(str), sub["area_ha"] / 1000.0)
+                ax.set_xlabel("Strong loss area (thousand ha)")
+                ax.set_ylabel("Ecoregion")
+                ax.set_title(f"Top {min(TOP_N_ECOREGIONS, len(sub))} ecoregions by strong loss — {win}")
+                ax.invert_yaxis()
+                _save_plot(fig, chart_dir / f"{PREFIX}_03_top_ecoregions_strong_loss_{win}_{TIME_TAG}.png")
+
+    # 4) Mean NDVI by LULC group across baseline and reporting windows.
+    if not ndvi_df.empty and "LULC_label" in ndvi_df.columns:
+        df4 = ndvi_df[ndvi_df["summary_level"].astype(str).isin([
+            "baseline_ecoregion_lulc_2001",
+            "reporting_ecoregion_lulc_2011",
+            "reporting_ecoregion_lulc_2022",
+        ])].copy()
+        if not df4.empty:
+            label_map = {
+                BASELINE_WINDOW_NAME: BASELINE_WINDOW_NAME,
+                "Performance_2011_vs_Baseline": "Reporting_2011_window",
+                "Performance_2022_vs_Baseline": "Reporting_2022_window",
+            }
+            df4["window_label"] = df4["summary_name"].map(label_map).fillna(df4["summary_name"])
+            df4 = (
+                df4.groupby(["window_label", "LULC_label"], dropna=False)
+                .apply(lambda g: pd.Series({
+                    "mean_ndvi": np.average(g["mean_ndvi"], weights=g["area_ha"]) if g["area_ha"].sum() > 0 else np.nan
+                }))
+                .reset_index()
+            )
+            p4 = df4.pivot(index="LULC_label", columns="window_label", values="mean_ndvi")
+            if not p4.empty:
+                fig, ax = plt.subplots(figsize=(11, 7))
+                p4.plot(kind="bar", ax=ax)
+                ax.set_ylabel("Mean NDVI")
+                ax.set_xlabel("LULC group")
+                ax.set_title("Mean NDVI by LULC group across baseline and reporting windows")
+                ax.legend(title="Window", bbox_to_anchor=(1.02, 1), loc="upper left")
+                plt.xticks(rotation=45, ha="right")
+                _save_plot(fig, chart_dir / f"{PREFIX}_04_mean_ndvi_by_lulc_{TIME_TAG}.png")
+
+
+def read_existing_summaries() -> tuple[pd.DataFrame, pd.DataFrame]:
+    class_csv = get_summary_dir() / f"{PREFIX}_performance_class_summary_{TIME_TAG}.csv"
+    ndvi_csv = get_summary_dir() / f"{PREFIX}_ndvi_window_summary_{TIME_TAG}.csv"
+
+    class_df = pd.read_csv(class_csv) if class_csv.exists() else pd.DataFrame()
+    ndvi_df = pd.read_csv(ndvi_csv) if ndvi_csv.exists() else pd.DataFrame()
+    return class_df, ndvi_df
+
+def make_country_performance_charts(class_df: pd.DataFrame) -> None:
+    """
+    Create country-level Performance charts.
+
+    This function uses numeric performance_class codes rather than text labels
+    to avoid blank charts caused by label mismatches.
+
+    performance_class:
+        1 = Strong loss
+        2 = Moderate loss
+        3 = Stable
+        4 = Moderate gain
+        5 = Strong gain
+    """
+    chart_dir = mkdir(get_chart_dir())
+
+    if class_df.empty:
+        print("[charts] empty class summary; skipping country charts.")
+        return
+
+    df = class_df[class_df["summary_level"] == "country"].copy()
+
+    if df.empty:
+        print("[charts] no country-level rows found.")
+        return
+
+    if "ISO_A3" not in df.columns:
+        print("[charts] ISO_A3 column not found; skipping country charts.")
+        return
+
+    df["performance_class"] = pd.to_numeric(
+        df["performance_class"],
+        errors="coerce"
+    ).astype("Int64")
+
+    # ---------------------------------------------------------
+    # 1. Country performance class composition
+    # ---------------------------------------------------------
+    for win in sorted(df["performance_window"].dropna().unique()):
+        sub = df[df["performance_window"] == win].copy()
+
+        p = (
+            sub.pivot_table(
+                index="ISO_A3",
+                columns="performance_class",
+                values="area_ha",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+        )
+
+        for c in [1, 2, 3, 4, 5]:
+            if c not in p.columns:
+                p[c] = 0.0
+
+        p = p[[1, 2, 3, 4, 5]]
+        p.columns = [PERFORMANCE_CLASS_LABELS[c] for c in [1, 2, 3, 4, 5]]
+
+        p_pct = p.div(p.sum(axis=1).replace(0, np.nan), axis=0) * 100.0
+        p_pct = p_pct.fillna(0.0)
+
+        strong_loss_label = PERFORMANCE_CLASS_LABELS[1]
+        p_pct = p_pct.sort_values(strong_loss_label, ascending=False)
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+        p_pct.plot(kind="bar", stacked=True, ax=ax)
+
+        ax.set_ylabel("Area share (%)")
+        ax.set_xlabel("Country")
+        ax.set_title(f"Performance class composition by country — {win}")
+        ax.legend(
+            title="Performance class",
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left"
+        )
+        plt.xticks(rotation=90)
+
+        _save_plot(
+            fig,
+            chart_dir / f"{PREFIX}_05_country_class_share_{win}_{TIME_TAG}.png"
+        )
+
+    # ---------------------------------------------------------
+    # 2. Top countries by strong loss area
+    # ---------------------------------------------------------
+    df_loss = df[df["performance_class"] == 1].copy()
+
+    if not df_loss.empty:
+        for win in sorted(df_loss["performance_window"].dropna().unique()):
+            sub = df_loss[df_loss["performance_window"] == win].copy()
+            sub = sub.sort_values("area_ha", ascending=False).head(20)
+
+            if sub.empty:
+                print(f"[charts] no strong-loss country records for {win}; skipping area chart.")
+                continue
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.barh(sub["ISO_A3"], sub["area_ha"] / 1_000_000.0)
+
+            ax.set_xlabel("Strong loss area (million ha)")
+            ax.set_ylabel("Country")
+            ax.set_title(f"Top countries by strong loss area — {win}")
+            ax.invert_yaxis()
+
+            _save_plot(
+                fig,
+                chart_dir / f"{PREFIX}_06_top_countries_strong_loss_area_{win}_{TIME_TAG}.png"
+            )
+
+    # ---------------------------------------------------------
+    # 3. Top countries by strong loss percentage
+    # ---------------------------------------------------------
+    rows = []
+
+    for win in sorted(df["performance_window"].dropna().unique()):
+        sub = df[df["performance_window"] == win].copy()
+
+        total = (
+            sub.groupby("ISO_A3", as_index=False)["area_ha"]
+            .sum()
+            .rename(columns={"area_ha": "total_ha"})
+        )
+
+        loss = (
+            sub[sub["performance_class"] == 1]
+            .groupby("ISO_A3", as_index=False)["area_ha"]
+            .sum()
+            .rename(columns={"area_ha": "strong_loss_ha"})
+        )
+
+        merged = total.merge(loss, on="ISO_A3", how="left")
+        merged["strong_loss_ha"] = merged["strong_loss_ha"].fillna(0.0)
+
+        merged["strong_loss_pct"] = np.where(
+            merged["total_ha"] > 0,
+            merged["strong_loss_ha"] / merged["total_ha"] * 100.0,
+            0.0,
+        )
+
+        merged["performance_window"] = win
+        rows.append(merged)
+
+    if rows:
+        pct_df = pd.concat(rows, ignore_index=True)
+
+        for win in sorted(pct_df["performance_window"].dropna().unique()):
+            sub = pct_df[pct_df["performance_window"] == win].copy()
+
+            # Remove zero-loss countries so the chart is not visually empty.
+            sub = sub[sub["strong_loss_ha"] > 0]
+            sub = sub.sort_values("strong_loss_pct", ascending=False).head(20)
+
+            if sub.empty:
+                print(f"[charts] no strong-loss country records for {win}; skipping pct chart.")
+                continue
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.barh(sub["ISO_A3"], sub["strong_loss_pct"])
+
+            ax.set_xlabel("Strong loss (%)")
+            ax.set_ylabel("Country")
+            ax.set_title(f"Top countries by strong loss percentage — {win}")
+            ax.invert_yaxis()
+
+            _save_plot(
+                fig,
+                chart_dir / f"{PREFIX}_07_top_countries_strong_loss_pct_{win}_{TIME_TAG}.png"
+            )
+
+
+def make_country_strong_loss_comparison_charts(class_df: pd.DataFrame) -> None:
+    """
+    Create combined country comparison charts for:
+        - Performance_2011_vs_Baseline
+        - Performance_2022_vs_Baseline
+
+    Countries are sorted by strong-loss area in the most recent window.
+    Uses performance_class == 1 to avoid label-mismatch problems.
+    """
+    chart_dir = mkdir(get_chart_dir())
+
+    if class_df.empty:
+        print("[charts] empty class summary; skipping country comparison charts.")
+        return
+
+    df = class_df[class_df["summary_level"] == "country"].copy()
+
+    if df.empty:
+        print("[charts] no country-level rows found; skipping country comparison charts.")
+        return
+
+    if "ISO_A3" not in df.columns:
+        print("[charts] ISO_A3 column not found; skipping country comparison charts.")
+        return
+
+    df["performance_class"] = pd.to_numeric(
+        df["performance_class"],
+        errors="coerce"
+    ).astype("Int64")
+
+    required_windows = [
+        "Performance_2011_vs_Baseline",
+        "Performance_2022_vs_Baseline",
+    ]
+
+    total_df = (
+        df.groupby(["performance_window", "ISO_A3"], as_index=False)["area_ha"]
+        .sum()
+        .rename(columns={"area_ha": "total_ha"})
+    )
+
+    loss_df = (
+        df[df["performance_class"] == 1]
+        .groupby(["performance_window", "ISO_A3"], as_index=False)["area_ha"]
+        .sum()
+        .rename(columns={"area_ha": "strong_loss_ha"})
+    )
+
+    merged = total_df.merge(loss_df, on=["performance_window", "ISO_A3"], how="left")
+    merged["strong_loss_ha"] = merged["strong_loss_ha"].fillna(0.0)
+
+    merged["strong_loss_pct"] = np.where(
+        merged["total_ha"] > 0,
+        merged["strong_loss_ha"] / merged["total_ha"] * 100.0,
+        0.0,
+    )
+
+    area_wide = (
+        merged.pivot(
+            index="ISO_A3",
+            columns="performance_window",
+            values="strong_loss_ha"
+        )
+        .fillna(0.0)
+    )
+
+    pct_wide = (
+        merged.pivot(
+            index="ISO_A3",
+            columns="performance_window",
+            values="strong_loss_pct"
+        )
+        .fillna(0.0)
+    )
+
+    for w in required_windows:
+        if w not in area_wide.columns:
+            area_wide[w] = 0.0
+        if w not in pct_wide.columns:
+            pct_wide[w] = 0.0
+
+    area_wide = area_wide[required_windows]
+    pct_wide = pct_wide[required_windows]
+
+    area_wide = area_wide.sort_values(
+        by=["Performance_2022_vs_Baseline", "Performance_2011_vs_Baseline"],
+        ascending=False,
+    )
+
+    pct_wide = pct_wide.loc[area_wide.index]
+
+    top_n = globals().get("TOP_N_COUNTRIES", 25)
+    if top_n is not None:
+        area_wide = area_wide.head(top_n)
+        pct_wide = pct_wide.loc[area_wide.index]
+
+    if area_wide.empty:
+        print("[charts] no country strong-loss data available.")
+        return
+
+    display_names = {
+        "Performance_2011_vs_Baseline": "2011 vs baseline",
+        "Performance_2022_vs_Baseline": "2022 vs baseline",
+    }
+
+    y = np.arange(len(area_wide))
+    bar_h = 0.38
+
+    fig, ax = plt.subplots(figsize=(12, max(8, len(area_wide) * 0.35)))
+
+    ax.barh(
+        y - bar_h / 2,
+        area_wide["Performance_2011_vs_Baseline"] / 1_000_000.0,
+        height=bar_h,
+        label=display_names["Performance_2011_vs_Baseline"],
+    )
+
+    ax.barh(
+        y + bar_h / 2,
+        area_wide["Performance_2022_vs_Baseline"] / 1_000_000.0,
+        height=bar_h,
+        label=display_names["Performance_2022_vs_Baseline"],
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(area_wide.index)
+    ax.invert_yaxis()
+
+    ax.set_xlabel("Strong loss area (million ha)")
+    ax.set_ylabel("Country")
+    ax.set_title("Country comparison of strong loss area: 2011 vs 2022")
+    ax.legend(title="Performance window")
+
+    _save_plot(
+        fig,
+        chart_dir / f"{PREFIX}_08_country_strong_loss_area_compare_{TIME_TAG}.png"
+    )
+
+    y = np.arange(len(pct_wide))
+
+    fig, ax = plt.subplots(figsize=(12, max(8, len(pct_wide) * 0.35)))
+
+    ax.barh(
+        y - bar_h / 2,
+        pct_wide["Performance_2011_vs_Baseline"],
+        height=bar_h,
+        label=display_names["Performance_2011_vs_Baseline"],
+    )
+
+    ax.barh(
+        y + bar_h / 2,
+        pct_wide["Performance_2022_vs_Baseline"],
+        height=bar_h,
+        label=display_names["Performance_2022_vs_Baseline"],
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(pct_wide.index)
+    ax.invert_yaxis()
+
+    ax.set_xlabel("Strong loss share (%)")
+    ax.set_ylabel("Country")
+    ax.set_title("Country comparison of strong loss percentage: 2011 vs 2022")
+    ax.legend(title="Performance window")
+
+    _save_plot(
+        fig,
+        chart_dir / f"{PREFIX}_09_country_strong_loss_pct_compare_{TIME_TAG}.png"
+    )
+
+def make_country_class_share_comparison_chart(class_df: pd.DataFrame) -> None:
+    """
+    Create one combined country chart where each country has two stacked bars:
+        - left  = Performance_2011_vs_Baseline
+        - right = Performance_2022_vs_Baseline
+
+    Each bar shows the percentage composition of the five performance classes.
+    """
+    chart_dir = mkdir(get_chart_dir())
+
+    if class_df.empty:
+        print("[charts] empty class summary; skipping combined country class-share chart.")
+        return
+
+    df = class_df[class_df["summary_level"] == "country"].copy()
+    if df.empty:
+        print("[charts] no country-level rows found; skipping combined country class-share chart.")
+        return
+
+    if "ISO_A3" not in df.columns:
+        print("[charts] ISO_A3 column not found; skipping combined country class-share chart.")
+        return
+
+    df["performance_class"] = pd.to_numeric(
+        df["performance_class"],
+        errors="coerce"
+    ).astype("Int64")
+
+    required_windows = [
+        "Performance_2011_vs_Baseline",
+        "Performance_2022_vs_Baseline",
+    ]
+
+    sub = df[df["performance_window"].isin(required_windows)].copy()
+    if sub.empty:
+        print("[charts] no matching windows found for combined country class-share chart.")
+        return
+
+    # ---------------------------------------------------------
+    # pivot to country x window x class
+    # ---------------------------------------------------------
+    p = (
+        sub.pivot_table(
+            index=["ISO_A3", "performance_window"],
+            columns="performance_class",
+            values="area_ha",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+    )
+
+    for c in [1, 2, 3, 4, 5]:
+        if c not in p.columns:
+            p[c] = 0.0
+
+    p = p[[1, 2, 3, 4, 5]]
+
+    # convert to % within each country-window
+    p_pct = p.div(p.sum(axis=1).replace(0, np.nan), axis=0) * 100.0
+    p_pct = p_pct.fillna(0.0)
+
+    # split by window
+    p2011 = p_pct.xs("Performance_2011_vs_Baseline", level="performance_window", drop_level=True) \
+        if "Performance_2011_vs_Baseline" in p_pct.index.get_level_values("performance_window") \
+        else pd.DataFrame(columns=[1, 2, 3, 4, 5])
+
+    p2022 = p_pct.xs("Performance_2022_vs_Baseline", level="performance_window", drop_level=True) \
+        if "Performance_2022_vs_Baseline" in p_pct.index.get_level_values("performance_window") \
+        else pd.DataFrame(columns=[1, 2, 3, 4, 5])
+
+    # make sure both have same country set
+    all_countries = sorted(set(p2011.index).union(set(p2022.index)))
+    p2011 = p2011.reindex(all_countries).fillna(0.0)
+    p2022 = p2022.reindex(all_countries).fillna(0.0)
+
+    # sort countries by 2022 strong loss %, then 2011 strong loss %
+    p_sort = pd.DataFrame({
+        "sl_2022": p2022[1],
+        "sl_2011": p2011[1],
+    }, index=all_countries).sort_values(
+        by=["sl_2022", "sl_2011"],
+        ascending=False
+    )
+
+    countries = list(p_sort.index)
+
+    if TOP_N_COUNTRIES is not None:
+        countries = countries[:TOP_N_COUNTRIES]
+
+    p2011 = p2011.loc[countries]
+    p2022 = p2022.loc[countries]
+
+    if len(countries) == 0:
+        print("[charts] no countries available for combined country class-share chart.")
+        return
+
+    # ---------------------------------------------------------
+    # plot grouped stacked bars
+    # ---------------------------------------------------------
+    import matplotlib.patches as mpatches
+
+    x = np.arange(len(countries))
+    width = 0.38
+
+    # use same colors for classes
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"][:5]
+    class_order = [1, 2, 3, 4, 5]
+    class_labels = [PERFORMANCE_CLASS_LABELS[c] for c in class_order]
+
+    fig_width = max(16, len(countries) * 0.36)
+    fig, ax = plt.subplots(figsize=(fig_width, 8))
+
+    bottom_2011 = np.zeros(len(countries))
+    bottom_2022 = np.zeros(len(countries))
+
+    for i, cls in enumerate(class_order):
+        vals_2011 = p2011[cls].values
+        vals_2022 = p2022[cls].values
+
+        ax.bar(
+            x - width / 2,
+            vals_2011,
+            width=width,
+            bottom=bottom_2011,
+            color=colors[i],
+            edgecolor="black",
+            linewidth=0.2,
+        )
+
+        ax.bar(
+            x + width / 2,
+            vals_2022,
+            width=width,
+            bottom=bottom_2022,
+            color=colors[i],
+            edgecolor="black",
+            linewidth=0.2,
+            hatch="//",
+        )
+
+        bottom_2011 += vals_2011
+        bottom_2022 += vals_2022
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(countries, rotation=90)
+    ax.set_ylabel("Area share (%)")
+    ax.set_xlabel("Country")
+    ax.set_title("Performance class composition by country: 2011 vs 2022")
+    ax.set_ylim(0, 100)
+
+    # two legends: one for class color, one for window style
+    class_handles = [
+        mpatches.Patch(facecolor=colors[i], edgecolor="black", label=class_labels[i])
+        for i in range(len(class_order))
+    ]
+
+    window_handles = [
+        mpatches.Patch(facecolor="white", edgecolor="black", label="2011 vs baseline"),
+        mpatches.Patch(facecolor="white", edgecolor="black", hatch="//", label="2022 vs baseline"),
+    ]
+
+    leg1 = ax.legend(
+        handles=class_handles,
+        title="Performance class",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left"
+    )
+    ax.add_artist(leg1)
+
+    ax.legend(
+        handles=window_handles,
+        title="Window",
+        bbox_to_anchor=(1.02, 0.45),
+        loc="upper left"
+    )
+
+    _save_plot(
+        fig,
+        chart_dir / f"{PREFIX}_10_country_class_share_compare_{TIME_TAG}.png"
+    )
+# =============================================================================
+# 12. MAIN
+# =============================================================================
+
+def main():
+    T0 = time.perf_counter()
+
+    print("\n" + "#" * 100)
+    print("CONTINENTAL NDVI PERFORMANCE ASSESSMENT FROM STATE CACHE")
+    print("#" * 100)
+    print(f"Start time: {_now()}")
+    print(f"STATE_CACHE_DIR: {STATE_CACHE_DIR}")
+    print(f"PERF_OUT_ROOT: {PERF_OUT_ROOT}")
+    print(f"TIME_TAG: {TIME_TAG}")
+    print(f"BASELINE_YEARS: {BASELINE_YEARS}")
+    print(f"PERFORMANCE_WINDOWS: {PERFORMANCE_WINDOWS}")
+    print(f"RUN_BUILD_PERFORMANCE_RASTERS: {RUN_BUILD_PERFORMANCE_RASTERS}")
+    print(f"RUN_SUMMARY_TABLES: {RUN_SUMMARY_TABLES}")
+    print(f"RUN_CHARTS: {RUN_CHARTS}")
+    print("#" * 100)
+
+    mkdir(PERF_OUT_ROOT)
+    mkdir(get_raster_dir())
+    mkdir(get_summary_dir())
+    mkdir(get_diagnostic_dir())
+    mkdir(get_chart_dir())
+
+    validate_cache_inputs()
+
+    config = pd.DataFrame([
+        ("TIME_TAG", TIME_TAG),
+        ("STATE_CACHE_DIR", STATE_CACHE_DIR),
+        ("PERF_OUT_ROOT", PERF_OUT_ROOT),
+        ("BASELINE_WINDOW_NAME", BASELINE_WINDOW_NAME),
+        ("BASELINE_YEARS", BASELINE_YEARS),
+        ("BASELINE_LULC_YEAR", BASELINE_LULC_YEAR),
+        ("PERFORMANCE_WINDOWS", PERFORMANCE_WINDOWS),
+        ("MIN_VALID_OBS_BASELINE", MIN_VALID_OBS_BASELINE),
+        ("MIN_VALID_OBS_REPORTING", MIN_VALID_OBS_REPORTING),
+        ("NDVI_NODATA", NDVI_NODATA),
+        ("VALID_NDVI_RANGE", VALID_NDVI_RANGE),
+        ("BASELINE_DENOMINATOR_EPS", BASELINE_DENOMINATOR_EPS),
+        ("PERFORMANCE_FORMULA", "((reporting_window_mean - baseline_window_mean) / baseline_window_mean) * 100"),
+        ("STRONG_LOSS_TH", STRONG_LOSS_TH),
+        ("MODERATE_LOSS_TH", MODERATE_LOSS_TH),
+        ("MODERATE_GAIN_TH", MODERATE_GAIN_TH),
+        ("STRONG_GAIN_TH", STRONG_GAIN_TH),
+        ("EXCLUDE_LULC_GROUP_LABELS", EXCLUDE_LULC_GROUP_LABELS),
+        ("ANALYSIS_LULC_GROUPS", ANALYSIS_LULC_GROUPS),
+        ("REUSE_EXISTING_PERFORMANCE_RASTERS", REUSE_EXISTING_PERFORMANCE_RASTERS),
+        ("FORCE_REBUILD_PERFORMANCE_RASTERS", FORCE_REBUILD_PERFORMANCE_RASTERS),
+        ("RUN_BUILD_PERFORMANCE_RASTERS", RUN_BUILD_PERFORMANCE_RASTERS),
+        ("RUN_SUMMARY_TABLES", RUN_SUMMARY_TABLES),
+        ("RUN_CHARTS", RUN_CHARTS),
+        ("RUN_VEGETATED_DOMAIN_MASTER", RUN_VEGETATED_DOMAIN_MASTER),
+        ("USE_VEGETATED_DOMAIN_FOR_CHARTS", USE_VEGETATED_DOMAIN_FOR_CHARTS),
+        ("REUSE_EXISTING_VEGETATED_DOMAIN_MASTER", REUSE_EXISTING_VEGETATED_DOMAIN_MASTER),
+        ("SAVE_VEGETATED_DOMAIN_CHECK_TABLE", SAVE_VEGETATED_DOMAIN_CHECK_TABLE),
+    ], columns=["setting", "value"])
+
+    save_csv(config, PERF_OUT_ROOT / f"{PREFIX}_run_configuration_{TIME_TAG}.csv")
+
+    class_df = pd.DataFrame()
+    ndvi_df = pd.DataFrame()
+
+    if RUN_BUILD_PERFORMANCE_RASTERS:
+        build_performance_rasters()
+
+    if RUN_SUMMARY_TABLES:
+        class_df, ndvi_df = summarise_performance()
+
+    if RUN_CHARTS:
+        if class_df.empty and ndvi_df.empty and REUSE_EXISTING_SUMMARY_TABLES:
+            class_df, ndvi_df = read_existing_summaries()
+
+        # Build a sidecar master summary using the retained vegetated / analysis-relevant
+        # LULC domain. The original master CSV remains unchanged.
+        if RUN_VEGETATED_DOMAIN_MASTER:
+            vegetated_class_df = make_vegetated_domain_master_summary(class_df)
+        else:
+            vegetated_class_df = class_df
+
+        chart_class_df = (
+            vegetated_class_df
+            if USE_VEGETATED_DOMAIN_FOR_CHARTS and not vegetated_class_df.empty
+            else class_df
+        )
+
+        if USE_VEGETATED_DOMAIN_FOR_CHARTS:
+            print("[charts] using vegetated-domain master summary for Performance charts.")
+        else:
+            print("[charts] using original Performance summary for charts.")
+
+        make_performance_charts(chart_class_df, ndvi_df)
+        make_country_performance_charts(chart_class_df)
+        make_country_strong_loss_comparison_charts(chart_class_df)
+        make_country_class_share_comparison_chart(chart_class_df)
+
+    print("\n" + "#" * 100)
+    print("PERFORMANCE ASSESSMENT FINISHED")
+    print("#" * 100)
+    print(f"End time: {_now()}")
+    print(f"Elapsed: {_fmt(time.perf_counter() - T0)}")
+    print(f"Outputs: {PERF_OUT_ROOT}")
+    print("#" * 100)
+
+
+if __name__ == "__main__":
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    main()
+
+# %%

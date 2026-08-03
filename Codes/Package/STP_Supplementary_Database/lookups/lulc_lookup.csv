@@ -1,0 +1,12 @@
+lulc_code,lulc_name,interpretation_flag
+1,Cropland,Managed-system caution
+2,Cropland mosaic,Standard
+3,Natural/cropland mosaic,Standard
+4,Tree cover,Broad structural aggregation
+5,Shrubland,Standard
+6,Grassland,Standard
+7,Sparse/bare,Exclusion or low-confidence
+8,Wetland/flooded vegetation,Broad flooded-system aggregation
+9,Urban,Mixed built-vegetated context
+10,Water/snow/ice,Excluded
+11,Natural vegetation mosaic,Heterogeneous; cautious interpretation

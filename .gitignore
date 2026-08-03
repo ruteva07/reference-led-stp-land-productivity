@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Credentials
+.env
+.cdsapirc
+
+# Editors and notebooks
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Temporary and system files
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# Raster sidecars
+*.aux.xml
+*.ovr
+
+# Large downloaded data
+Data/**/*.zip
+Data/**/*.nc
+Data/**/*.nc4
+Data/**/*.hdf
+Data/**/*.tif
+Data/**/*.tiff

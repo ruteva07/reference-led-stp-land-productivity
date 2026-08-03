@@ -1,0 +1,9 @@
+code,label
+1,Compounding concern
+2,Persistent low condition
+3,Recovering but still low
+4,Emerging concern
+5,Stable intermediate condition
+6,Improving condition
+7,High condition with historical loss
+8,Mixed evidence
