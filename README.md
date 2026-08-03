@@ -251,14 +251,6 @@ Raw MODIS and CCI/C3S files are not necessarily redistributed because of volume 
 
 ## 6. Path configuration
 
-Before running:
-
-1. set the project/input/output roots near the beginning of each script;
-2. confirm all paths refer to the **Annual** workflow;
-3. remove references to development folders such as `Annual_test`, `Apr_Jun`, `v2` or temporary outputs;
-4. confirm the three polygon files exist;
-5. confirm all output directories are writable.
-
 In `Codes/Package/STP_Supplementary_Database/00_config.py`, verify:
 
 - `PROJECT_ROOT`;
