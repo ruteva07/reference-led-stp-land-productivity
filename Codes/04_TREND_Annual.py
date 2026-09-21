@@ -2494,3 +2494,428 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     main()
 # %%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Independent Trend DATA_PRODUCT builder.
+
+Builds only the positive Trend masks and the final 3-class Trend-direction
+product from already-generated Trend rasters.
+
+Default: only Trend_2001_2022 is ON.
+"""
+#%%
+from __future__ import annotations
+
+from pathlib import Path
+from contextlib import ExitStack
+from datetime import datetime, timedelta
+import time
+
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.windows import Window
+
+# =============================================================================
+# 0. USER SETTINGS
+# =============================================================================
+
+MAIN_FOLDER = Path(r"C:\Users\rutev\Documents\LandDegr_ecosy_Paper\Codes\Africa")
+TIME_TAG = "Apr_Jun"
+TREND_OUT_ROOT = MAIN_FOLDER / "TREND_NDVI_Africa_From_StateCache" / TIME_TAG
+PREFIX = "TrendNDVI"
+
+# Run exactly one period at a time.
+RUN_2001_2011 = False
+RUN_2012_2022 = False
+RUN_2001_2022 = True
+
+# Deliberately replace outputs for the selected period.
+OVERWRITE_SELECTED_PERIOD = True
+
+# =============================================================================
+# 1. ANALYTICAL SETTINGS — copied from the production Trend workflow
+# =============================================================================
+
+SLOPE_TH_PHYSICAL = -0.0002
+SLOPE_TH_PHYSICAL_POS = abs(SLOPE_TH_PHYSICAL)
+P_90 = 0.10
+ANALYSIS_LULC_GROUPS = [1, 2, 3, 4, 5, 6, 8, 9, 11]
+
+BLOCK_SIZE = 512
+COMPRESS = "ZSTD"
+ZSTD_LEVEL = 12
+TILE_SIZE = 512
+UINT8_NODATA = 0
+
+PERIOD_SWITCHES = {
+    "Trend_2001_2011": RUN_2001_2011,
+    "Trend_2012_2022": RUN_2012_2022,
+    "Trend_2001_2022": RUN_2001_2022,
+}
+
+IMPROVEMENT_MASK_LABELS = {
+    "ImproveP_pos": "Positive Trend confirmed by OLS p-value",
+    "ImproveNW_pos": "Positive Trend confirmed by Newey-West p-value",
+    "ImproveMK_pos": "Positive Trend confirmed by Mann-Kendall",
+    "ImprovePNW_pos": "Positive Trend confirmed by OLS p-value and Newey-West",
+    "ImprovePMK_pos": "Positive Trend confirmed by OLS p-value and Mann-Kendall",
+    "ImproveMKNW_pos": "Positive Trend confirmed by Mann-Kendall and Newey-West",
+    "ImprovePMKNW_pos": "Strict positive Trend confirmed by OLS, Mann-Kendall and Newey-West",
+}
+
+# =============================================================================
+# 2. HELPERS
+# =============================================================================
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt(seconds: float) -> str:
+    return str(timedelta(seconds=int(seconds)))
+
+
+def mkdir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_raster_dir(period: str) -> Path:
+    return TREND_OUT_ROOT / period / "rasters"
+
+
+def trend_raster_path(period: str, metric: str) -> Path:
+    return get_raster_dir(period) / f"{PREFIX}_{period}_{metric}_{TIME_TAG}_EA250m.tif"
+
+
+def mask_raster_path(period: str, mask_name: str) -> Path:
+    return get_raster_dir(period) / f"{PREFIX}_{period}_{mask_name}_{TIME_TAG}_EA250m.tif"
+
+
+def data_product_dir() -> Path:
+    return mkdir(TREND_OUT_ROOT / "DATA_PRODUCTS" / "TREND_DIRECTION" / TIME_TAG)
+
+
+def data_product_path(period: str, product: str) -> Path:
+    return data_product_dir() / f"{PREFIX}_{period}_{product}_{TIME_TAG}_EA250m.tif"
+
+
+def iter_windows(width: int, height: int, block_size: int = BLOCK_SIZE):
+    for row_off in range(0, height, block_size):
+        h = min(block_size, height - row_off)
+        for col_off in range(0, width, block_size):
+            w = min(block_size, width - col_off)
+            yield Window(col_off, row_off, w, h)
+
+
+def output_profile_like(src_profile: dict) -> dict:
+    profile = src_profile.copy()
+    profile.update(
+        driver="GTiff",
+        count=1,
+        dtype="uint8",
+        nodata=UINT8_NODATA,
+        compress=COMPRESS,
+        zstd_level=ZSTD_LEVEL,
+        tiled=True,
+        blockxsize=TILE_SIZE,
+        blockysize=TILE_SIZE,
+        BIGTIFF="IF_SAFER",
+    )
+    return profile
+
+
+def read_float(src, window: Window) -> np.ndarray:
+    arr = src.read(1, window=window).astype(np.float32)
+    if src.nodata is not None:
+        arr[arr == src.nodata] = np.nan
+    arr[arr == -9999.0] = np.nan
+    return arr
+
+
+def required_sources(period: str) -> dict[str, Path]:
+    return {
+        "slope": trend_raster_path(period, "NDVI_slope_per_year"),
+        "p": trend_raster_path(period, "NDVI_p"),
+        "nw_p": trend_raster_path(period, "NDVI_NeweyWest_p"),
+        "mk_p": trend_raster_path(period, "NDVI_MK_p"),
+        "mk_tau": trend_raster_path(period, "NDVI_MK_tau"),
+        "lulc_mode": trend_raster_path(period, "LULC_mode"),
+        "strict_degradation": mask_raster_path(period, "DegrPMKNW_neg"),
+    }
+
+
+def validate_alignment(paths: dict[str, Path]) -> dict:
+    first = next(iter(paths.values()))
+    with rasterio.open(first) as ref:
+        ref_profile = ref.profile.copy()
+        ref_shape = (ref.height, ref.width)
+        ref_crs = ref.crs
+        ref_transform = ref.transform
+
+    for name, path in paths.items():
+        if not path.exists():
+            raise FileNotFoundError(f"Missing required source [{name}]:\n{path}")
+        with rasterio.open(path) as src:
+            if (src.height, src.width) != ref_shape:
+                raise ValueError(f"Shape mismatch [{name}]: {path}")
+            if src.crs != ref_crs:
+                raise ValueError(f"CRS mismatch [{name}]: {path}")
+            if src.transform != ref_transform:
+                raise ValueError(f"Transform mismatch [{name}]: {path}")
+
+    return ref_profile
+
+
+def audit_output(path: Path) -> dict:
+    counts = {}
+    try:
+        with rasterio.open(path) as src:
+            for _, win in src.block_windows(1):
+                arr = src.read(1, window=win)
+                values, n = np.unique(arr, return_counts=True)
+                for value, count in zip(values, n):
+                    counts[int(value)] = counts.get(int(value), 0) + int(count)
+        return {
+            "readable": True,
+            "size_mb": path.stat().st_size / (1024 ** 2),
+            "value_counts": counts,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "readable": False,
+            "size_mb": path.stat().st_size / (1024 ** 2) if path.exists() else 0.0,
+            "value_counts": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+# =============================================================================
+# 3. BUILD ONE SELECTED PERIOD
+# =============================================================================
+
+def build_data_products(period: str) -> None:
+    print("\n" + "=" * 110)
+    print(f"TREND DATA PRODUCTS ONLY — {period}")
+    print("=" * 110)
+
+    sources = required_sources(period)
+    profile = validate_alignment(sources)
+    width = profile["width"]
+    height = profile["height"]
+    profile_u8 = output_profile_like(profile)
+
+    outputs = {
+        name: data_product_path(period, name)
+        for name in IMPROVEMENT_MASK_LABELS
+    }
+    outputs["TrendDirection3Class_PMKNW"] = data_product_path(
+        period, "TrendDirection3Class_PMKNW"
+    )
+
+    if not OVERWRITE_SELECTED_PERIOD:
+        existing = [p for p in outputs.values() if p.exists()]
+        if existing:
+            raise FileExistsError(
+                "Outputs already exist for selected period. Set OVERWRITE_SELECTED_PERIOD=True.\n"
+                + "\n".join(map(str, existing))
+            )
+
+    windows = list(iter_windows(width, height, BLOCK_SIZE))
+    n_windows = len(windows)
+
+    counters = {
+        "all_pixels": 0,
+        "finite_slope": 0,
+        "analysis_lulc": 0,
+        "valid_domain": 0,
+        "strict_degradation": 0,
+        "ImproveP_pos": 0,
+        "ImproveNW_pos": 0,
+        "ImproveMK_pos": 0,
+        "ImprovePNW_pos": 0,
+        "ImprovePMK_pos": 0,
+        "ImproveMKNW_pos": 0,
+        "ImprovePMKNW_pos": 0,
+        "Direction_1_degradation": 0,
+        "Direction_2_neutral": 0,
+        "Direction_3_improvement": 0,
+    }
+
+    print(f"Raster size : {width:,} x {height:,}")
+    print(f"Blocks      : {n_windows:,}")
+    print(f"Start       : {_now()}")
+
+    t0 = time.perf_counter()
+
+    with ExitStack() as stack:
+        src_slope = stack.enter_context(rasterio.open(sources["slope"]))
+        src_p = stack.enter_context(rasterio.open(sources["p"]))
+        src_nw_p = stack.enter_context(rasterio.open(sources["nw_p"]))
+        src_mk_p = stack.enter_context(rasterio.open(sources["mk_p"]))
+        src_mk_tau = stack.enter_context(rasterio.open(sources["mk_tau"]))
+        src_lulc = stack.enter_context(rasterio.open(sources["lulc_mode"]))
+        src_degr = stack.enter_context(rasterio.open(sources["strict_degradation"]))
+
+        # Exactly one writer per output path.
+        dsts = {
+            name: stack.enter_context(rasterio.open(path, "w", **profile_u8))
+            for name, path in outputs.items()
+        }
+
+        for i, win in enumerate(windows, start=1):
+            slope = read_float(src_slope, win)
+            p = read_float(src_p, win)
+            nw_p = read_float(src_nw_p, win)
+            mk_p = read_float(src_mk_p, win)
+            mk_tau = read_float(src_mk_tau, win)
+            lulc = src_lulc.read(1, window=win).astype(np.uint8)
+            strict_degr_existing = src_degr.read(1, window=win).astype(np.uint8)
+
+            finite_slope = np.isfinite(slope)
+            lulc_valid = np.isin(lulc, ANALYSIS_LULC_GROUPS)
+            valid = finite_slope & lulc_valid
+
+            improve_p = (
+                valid & np.isfinite(p) & (p < P_90)
+                & (slope >= SLOPE_TH_PHYSICAL_POS)
+            )
+            improve_nw = (
+                valid & np.isfinite(nw_p) & (nw_p < P_90)
+                & (slope >= SLOPE_TH_PHYSICAL_POS)
+            )
+            improve_mk = (
+                valid & np.isfinite(mk_p) & (mk_p < P_90)
+                & np.isfinite(mk_tau) & (mk_tau > 0)
+            )
+
+            improve_pnw = improve_p & improve_nw
+            improve_pmk = improve_p & improve_mk
+            improve_mknw = improve_mk & improve_nw
+            improve_strict = improve_p & improve_mk & improve_nw
+
+            strict_degr = valid & (strict_degr_existing == 1)
+
+            direction = np.zeros(slope.shape, dtype=np.uint8)
+            direction[valid] = 2
+            direction[strict_degr] = 1
+            direction[improve_strict] = 3
+
+            overlap = strict_degr & improve_strict
+            if np.any(overlap):
+                direction[overlap] = 2
+
+            masks = {
+                "ImproveP_pos": improve_p,
+                "ImproveNW_pos": improve_nw,
+                "ImproveMK_pos": improve_mk,
+                "ImprovePNW_pos": improve_pnw,
+                "ImprovePMK_pos": improve_pmk,
+                "ImproveMKNW_pos": improve_mknw,
+                "ImprovePMKNW_pos": improve_strict,
+            }
+
+            for name, mask in masks.items():
+                dsts[name].write(mask.astype(np.uint8), 1, window=win)
+
+            dsts["TrendDirection3Class_PMKNW"].write(direction, 1, window=win)
+
+            counters["all_pixels"] += slope.size
+            counters["finite_slope"] += int(finite_slope.sum())
+            counters["analysis_lulc"] += int(lulc_valid.sum())
+            counters["valid_domain"] += int(valid.sum())
+            counters["strict_degradation"] += int(strict_degr.sum())
+            for name, mask in masks.items():
+                counters[name] += int(mask.sum())
+            counters["Direction_1_degradation"] += int((direction == 1).sum())
+            counters["Direction_2_neutral"] += int((direction == 2).sum())
+            counters["Direction_3_improvement"] += int((direction == 3).sum())
+
+            if i % 50 == 0 or i == n_windows:
+                print(
+                    f"[{period}] {i:,}/{n_windows:,} blocks | "
+                    f"valid={counters['valid_domain']:,} | "
+                    f"strict improve={counters['ImprovePMKNW_pos']:,} | "
+                    f"elapsed {_fmt(time.perf_counter() - t0)}"
+                )
+
+    # Writers are closed here.
+    print("\nSource-domain / classification totals:")
+    for key, value in counters.items():
+        print(f"  {key:<30}: {value:,}")
+
+    audit_rows = []
+    print("\nPost-close full output audit:")
+    for name, path in outputs.items():
+        result = audit_output(path)
+        print(
+            f"  {'PASS' if result['readable'] else 'FAIL'} | "
+            f"{result['size_mb']:8.2f} MB | {name:<32} | "
+            f"{result['value_counts']}"
+        )
+        audit_rows.append({
+            "period": period,
+            "product": name,
+            "path": str(path),
+            **result,
+        })
+
+    summary_csv = data_product_dir() / f"{PREFIX}_{period}_DATA_PRODUCT_source_counts_{TIME_TAG}.csv"
+    audit_csv = data_product_dir() / f"{PREFIX}_{period}_DATA_PRODUCT_output_audit_{TIME_TAG}.csv"
+
+    pd.DataFrame([
+        {"period": period, "diagnostic": key, "pixel_count": value}
+        for key, value in counters.items()
+    ]).to_csv(summary_csv, index=False)
+
+    pd.DataFrame(audit_rows).to_csv(audit_csv, index=False)
+
+    print(f"\n[write] {summary_csv}")
+    print(f"[write] {audit_csv}")
+    print(f"Finished: {_now()}")
+
+# =============================================================================
+# 4. MAIN
+# =============================================================================
+
+def main():
+    selected = [period for period, run_it in PERIOD_SWITCHES.items() if run_it]
+
+    if len(selected) == 0:
+        raise RuntimeError("No period is ON. Set exactly one RUN_* switch to True.")
+
+    if len(selected) > 1:
+        raise RuntimeError("More than one period is ON. Set exactly one RUN_* switch to True.")
+
+    period = selected[0]
+
+    print("\n" + "#" * 110)
+    print("INDEPENDENT TREND DATA-PRODUCT BUILDER")
+    print("#" * 110)
+    print(f"TIME_TAG       : {TIME_TAG}")
+    print(f"TREND_OUT_ROOT : {TREND_OUT_ROOT}")
+    print(f"Selected       : {period}")
+    print("#" * 110)
+
+    build_data_products(period)
+
+
+if __name__ == "__main__":
+    main()
+# %%
