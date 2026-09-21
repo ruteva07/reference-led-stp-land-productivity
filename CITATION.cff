@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+
+title: "Reference-led STP land-productivity analysis"
+
+authors:
+  - family-names: "Rutebuka"
+    given-names: "Evariste"
+    affiliation 1: "The University of Melbourne"
+    affiliation 2: "Natural Capital Insights"
+    affiliation 3: "University of Rwanda"
+
+version: 1.0.0
+date-released: 2026-08-04
+
+doi: 10.5281/zenodo.21782985
+
+url: "https://github.com/ruteva07/reference-led-stp-land-productivity"
+
+license: MIT
