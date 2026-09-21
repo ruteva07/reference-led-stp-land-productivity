@@ -104,7 +104,7 @@ from rasterio.windows import Window
 # =============================================================================
 # 0. USER SETTINGS
 # =============================================================================
-MAIN_FOLDER = Path(r"C:\Users\rutev\Documents\LandDegr_ecosy_Paper\Codes\Africa")
+MAIN_FOLDER = Path(r"......\Africa")
 
 TIME_TAG = "Annual"
 
