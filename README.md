@@ -492,7 +492,7 @@ Cite both the associated manuscript and archived software release.
 
 Suggested software citation:
 
-> Rutebuka, E. *Reference-explicit State–Trend–Performance analysis of land productivity: reproducible code and supplementary workflow*. Version `<release>`. `<repository DOI or URL>`.
+> Rutebuka, E. (2026). Reference-led STP land-productivity analysis (Version v1.0.1) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.22872704.
 
 
 ---
