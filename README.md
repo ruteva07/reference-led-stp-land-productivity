@@ -1,10 +1,10 @@
-# Reference-led State–Trend–Performance analysis of land productivity
+# Reference-explicit State–Trend–Performance analysis of land productivity
 
 This repository contains the reproducible Python workflow used to construct, evaluate and integrate benchmark-relative **State**, multi-window **Trend** and fixed-baseline **Performance** indicators from annual MODIS NDVI across terrestrial Africa.
 
 The code accompanies the manuscript:
 
-> **Reference-led re-operationalisation of productivity-based State, Trend and Performance beyond harmonised land-degradation reporting**
+> **Adapting land productivity indicators beyond land degradation neutrality**
 
 The numbered scripts reproduce the main processing stages. The `STP_Supplementary_Database` package then aggregates the canonical raster products into reporting-unit summaries, diagnostic tables, figures and joint State–Trend–Performance outputs.
 
@@ -76,7 +76,7 @@ flowchart TD
     Z --> G
     G --> H[State sensitivity and summaries]
     G --> I[Trend trajectories and support funnel]
-    G --> J[Performance transitions]
+    G --> J[Performance baseline-context sensitivity]
     G --> K[45-class joint STP raster]
     K --> L[Eight diagnostic groups]
     G --> M[Tables, figures, QC and logs]
@@ -86,7 +86,7 @@ The workflow has four phases:
 
 1. **Data acquisition** — obtain MODIS NDVI and annual ESA CCI/C3S land cover.
 2. **Core metric construction** — generate canonical State, Trend and Performance rasters.
-3. **Metric-specific diagnostics** — evaluate reference support and Trend statistical/LULC-transition support.
+3. **Metric-specific diagnostics** — evaluate State reference support, Trend statistical/LULC-transition support and Performance baseline-context sensitivity.
 4. **STP integration and reporting** — aggregate the canonical products and generate manuscript and supplementary outputs.
 
 ---
@@ -151,9 +151,8 @@ Strict decline requires negative slope plus OLS, Newey–West and Mann–Kendall
 Performance represents same-pixel displacement from a fixed early baseline:
 
 - baseline: mean annual NDVI, **2001–2003**;
-- earlier assessment: mean annual NDVI, **2009–2011**;
-- recent assessment: mean annual NDVI, **2020–2022**;
-- minimum support: two valid annual values in each three-year window.
+- reporting period: mean annual NDVI, **2020–2022**;
+- minimum support: at least two valid annual NDVI values within each three-year window.
 
 ```text
 Performance (%) =
@@ -168,7 +167,18 @@ Performance (%) =
 | 4 | Moderate gain | > +5% to +10% |
 | 5 | Strong gain | > +10% |
 
-These are magnitude classes, not statistical-significance classes.
+These are magnitude classes, not statistical-significance classes. The symmetric ±5% and ±10% boundaries are operational categories of displacement rather than universal ecological thresholds.
+
+#### Baseline-context sensitivity
+
+Because baseline NDVI enters directly as the denominator of proportional change, the workflow evaluates whether extreme Performance classifications depend on starting productivity in two complementary ways:
+
+1. **Absolute baseline screening** — progressively exclude pixels with baseline NDVI below **0.05, 0.10, 0.15 and 0.20** and calculate the proportion of the original Strong-loss and Strong-gain areas retained.
+2. **Relative baseline position** — derive **D10–D90** from the 2001–2003 baseline NDVI distribution independently within each included 2022 land-cover class, then assess whether Strong-loss and Strong-gain pixels are disproportionately associated with lower or higher positions in that class-specific distribution.
+
+For the D10–D90 analysis, proportional expectation is defined by the fraction of the land-cover distribution below each decile. For example, 10% of the domain is expected below D10 and 50% below D50 if Performance-class membership is unrelated to baseline position. Departures from this expectation describe association with starting position; they do not by themselves establish an ecological cause because baseline NDVI is mathematically embedded in the percentage-change metric.
+
+These sensitivity analyses do **not** redefine the production Performance classes. They provide context for interpreting the same 2020–2022 Performance classification relative to the fixed 2001–2003 same-pixel baseline. The workflow also generates the manuscript baseline-context figure showing (a) land-cover-specific D10–D90 baseline NDVI thresholds, (b) Strong-loss occurrence below each threshold and (c) Strong-gain occurrence below each threshold.
 
 ### 3.4 Joint STP
 
@@ -176,7 +186,7 @@ The joint workflow combines:
 
 - ecological–parametric State in 2022;
 - strict full-period Trend for 2001–2022;
-- recent Performance for 2020–2022 relative to 2001–2003.
+- Performance for 2020–2022 relative to the fixed 2001–2003 baseline.
 
 The full cross-classification contains `3 State × 3 Trend × 5 Performance = 45` combinations. These are retained in the 45-class raster and sequentially assigned to eight mutually exclusive diagnostic groups:
 
@@ -320,7 +330,7 @@ Core outputs include OLS, Newey–West and Mann–Kendall statistics; valid-year
 python Codes/05_PERFORMANCE_Annual.py
 ```
 
-Core outputs include baseline/reporting-window means, valid-year counts, absolute difference, percentage change, five-class Performance rasters, summaries and charts.
+Core outputs include the fixed 2001–2003 baseline mean, the 2020–2022 reporting-period mean, valid-year counts, absolute NDVI displacement, percentage change, the five-class Performance raster, absolute-baseline sensitivity tables, land-cover-specific D10–D90 baseline-position analyses and the associated manuscript figure.
 
 ### Stage 6 — Prepare reusable reporting zones
 
@@ -394,7 +404,7 @@ The runner loads `00_config.py`, creates a timestamped log, validates raster ali
 | Joint STP only | False | False | False | False | True |
 | Complete post-processing | False | True | True | True | True |
 
-Joint STP requires valid canonical State, full-period Trend-direction and recent Performance rasters, plus prepared reporting zones.
+Joint STP requires valid canonical State, full-period Trend-direction and 2020–2022 Performance rasters, plus prepared reporting zones.
 
 ---
 
@@ -418,7 +428,7 @@ Key products include:
 - reusable zone rasters and lookup tables;
 - State composition, formulation sensitivity and agreement tables;
 - Trend direction summaries, earlier-to-recent trajectories and statistical-support funnels;
-- Performance period summaries and class-transition analyses;
+- Performance summaries, absolute-baseline sensitivity and land-cover-specific D10–D90 baseline-position analyses;
 - `joint_stp_45class_EA250m.tif`;
 - `joint_stp_diagnostic_group_EA250m.tif`;
 - country, ecoregion, LULC and combined-zone summaries;
@@ -450,10 +460,11 @@ A successful reproduction should verify:
 4. State benchmark IDs match the benchmark tables;
 5. strict-joint Trend area does not exceed any individual support mask;
 6. supported decline does not exceed potential negative slope;
-7. Performance transitions use pixels valid in both periods;
-8. joint STP contains only valid State, Trend and Performance codes;
-9. all 45 combinations map to exactly one diagnostic group;
-10. summary percentages are within 0–100, allowing only small floating-point tolerance.
+7. Performance baseline-sensitivity analyses use the same valid 2020–2022 Performance domain and fixed 2001–2003 baseline used for the primary classification;
+8. land-cover-specific D10–D90 thresholds are derived independently within each included 2022 land-cover class;
+9. joint STP contains only valid State, Trend and Performance codes;
+10. all 45 combinations map to exactly one diagnostic group;
+11. summary percentages are within 0–100, allowing only small floating-point tolerance.
 
 The package runner performs raster-alignment checking before module execution. Additional checks are written to `quality_control/` or diagnostic CSV files.
 
@@ -481,7 +492,7 @@ Cite both the associated manuscript and archived software release.
 
 Suggested software citation:
 
-> Rutebuka, E. *Reference-led State–Trend–Performance analysis of land productivity: reproducible code and supplementary workflow*. Version `<release>`. `<repository DOI or URL>`.
+> Rutebuka, E. *Reference-explicit State–Trend–Performance analysis of land productivity: reproducible code and supplementary workflow*. Version `<release>`. `<repository DOI or URL>`.
 
 
 ---
