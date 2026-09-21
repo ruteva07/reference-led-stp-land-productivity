@@ -123,7 +123,7 @@ LOOKUP_DIR = (
  
 PERF_OUT_ROOT = (
     MAIN_FOLDER
-    / "PERFORMANCE_NDVI_Africa_withDenom"
+    / "PERFORMANCE_NDVI_Africa_Annual"
     / TIME_TAG
 )
 PERF_OUT_ROOT.mkdir(parents=True, exist_ok=True)
